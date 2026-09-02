@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"mime/multipart"
@@ -25,15 +26,15 @@ import (
 )
 
 type Client struct {
-	token            string
-	baseURL          string
-	httpClient       *http.Client
-	timeout          time.Duration
-	throttler        Throttler
-	redis            *redis.Client
-	queueStartOnce   sync.Once
-	botID            string
-	outboundQueueKey string
+	token       string
+	baseURL     string
+	httpClient  *http.Client
+	timeout     time.Duration
+	throttler   Throttler
+	redis       *redis.Client
+	queueStart  sync.Once
+	botID       string
+	shardCount  int
 }
 
 // Throttler gates outbound sends. fleet.Limiter implements it with an AIMD
@@ -43,19 +44,22 @@ type Throttler interface {
 	Penalize(retryAfter time.Duration) time.Duration
 }
 
-func NewClient(token string, timeout time.Duration, socks5Proxy string, botID string, throttler Throttler) (*Client, error) {
+func NewClient(token string, timeout time.Duration, socks5Proxy string, botID string, throttler Throttler, shardCount int) (*Client, error) {
 	httpClient, err := newHTTPClient(timeout, socks5Proxy)
 	if err != nil {
 		return nil, err
 	}
+	if shardCount < 1 {
+		shardCount = 1
+	}
 	return &Client{
-		token:            token,
-		baseURL:          "https://api.telegram.org/bot" + token + "/",
-		httpClient:       httpClient,
-		timeout:          timeout,
-		throttler:        throttler,
-		botID:            botID,
-		outboundQueueKey: "outbound:" + botID,
+		token:      token,
+		baseURL:    "https://api.telegram.org/bot" + token + "/",
+		httpClient: httpClient,
+		timeout:    timeout,
+		throttler:  throttler,
+		botID:      botID,
+		shardCount: shardCount,
 	}, nil
 }
 
@@ -65,27 +69,36 @@ func (c *Client) StartOutboundQueue(ctx context.Context, redisClient *redis.Clie
 	if redisClient == nil {
 		return
 	}
-	c.queueStartOnce.Do(func() {
+	c.queueStart.Do(func() {
 		c.redis = redisClient
-		go c.runOutboundQueue(ctx)
+		if c.shardCount <= 1 {
+			go c.runOutboundQueueShard(ctx, -1)
+			log.Printf("outbound worker: bot=%s mode=legacy key=outbound:%s", c.botID, c.botID)
+		} else {
+			for i := 0; i < c.shardCount; i++ {
+				go c.runOutboundQueueShard(ctx, i)
+			}
+			log.Printf("outbound workers: bot=%s shards=%d", c.botID, c.shardCount)
+		}
 	})
 }
 
 // Call sends a request via the current bot's outbound queue.
 func (c *Client) Call(ctx context.Context, method string, params map[string]any) (APIResponse, error) {
-	return c.callViaQueue(ctx, c.outboundQueueKey, method, params)
+	return c.callViaQueue(ctx, c.botID, method, params)
 }
 
 // CallViaBot sends a request through the outbound queue of another bot.
 // This is used for routing messages to users connected to a different shard.
 func (c *Client) CallViaBot(ctx context.Context, targetBotID, method string, params map[string]any) (APIResponse, error) {
-	return c.callViaQueue(ctx, "outbound:"+targetBotID, method, params)
+	return c.callViaQueue(ctx, targetBotID, method, params)
 }
 
-func (c *Client) callViaQueue(ctx context.Context, queueKey, method string, params map[string]any) (APIResponse, error) {
+func (c *Client) callViaQueue(ctx context.Context, targetBotID, method string, params map[string]any) (APIResponse, error) {
 	if c.redis == nil {
 		return c.callDirect(ctx, method, params)
 	}
+	queueKey := outboundQueueKeyForBot(targetBotID, c.shardCount, extractChatID(params))
 	job, err := newOutboundJob(method, params)
 	if err != nil {
 		return APIResponse{}, err
@@ -203,7 +216,8 @@ const (
 // EnqueueOutbound pushes a fire-and-forget API job onto another bot's outbound
 // queue without waiting for a response. Used by the fleet manager for batch
 // notifications; the destination instance applies its own adaptive throttling.
-func EnqueueOutbound(ctx context.Context, rdb *redis.Client, targetBotID, method string, params map[string]any) error {
+// shardCount controls how many parallel queues exist per bot (1 = legacy key).
+func EnqueueOutbound(ctx context.Context, rdb *redis.Client, targetBotID, method string, params map[string]any, shardCount int) error {
 	if rdb == nil {
 		return errors.New("telegram enqueue: nil redis")
 	}
@@ -215,9 +229,10 @@ func EnqueueOutbound(ctx context.Context, rdb *redis.Client, targetBotID, method
 	if err != nil {
 		return err
 	}
+	queueKey := outboundQueueKeyForBot(targetBotID, shardCount, extractChatID(params))
 	pipe := rdb.TxPipeline()
-	pipe.RPush(ctx, "outbound:"+targetBotID, raw)
-	pipe.Expire(ctx, "outbound:"+targetBotID, 24*time.Hour)
+	pipe.RPush(ctx, queueKey, raw)
+	pipe.Expire(ctx, queueKey, 24*time.Hour)
 	_, err = pipe.Exec(ctx)
 	return err
 }
@@ -265,9 +280,15 @@ func (j outboundJob) decodedParams() (map[string]any, error) {
 	return params, nil
 }
 
-func (c *Client) runOutboundQueue(ctx context.Context) {
+func (c *Client) runOutboundQueueShard(ctx context.Context, shard int) {
+	var queueKey string
+	if shard < 0 {
+		queueKey = "outbound:" + c.botID
+	} else {
+		queueKey = fmt.Sprintf("outbound:%s:shard:%d", c.botID, shard)
+	}
 	for {
-		item, err := c.redis.BLPop(ctx, time.Second, c.outboundQueueKey).Result()
+		item, err := c.redis.BLPop(ctx, time.Second, queueKey).Result()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -341,6 +362,46 @@ func randomID() string {
 		return strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	return fmt.Sprintf("%x", raw[:])
+}
+
+// fnv32a returns the FNV-1a 32-bit hash of s.
+func fnv32a(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
+}
+
+// extractChatID pulls the chat_id from params (string or int).
+func extractChatID(params map[string]any) string {
+	if params == nil {
+		return ""
+	}
+	switch v := params["chat_id"].(type) {
+	case string:
+		return v
+	case int:
+		return strconv.Itoa(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// outboundQueueKeyForBot returns the Redis key for the outbound queue of
+// targetBotID. When shardCount > 1, the chatID hash selects the shard;
+// shard -1 or shardCount <=1 uses the legacy key "outbound:<botID>".
+func outboundQueueKeyForBot(targetBotID string, shardCount int, chatID string) string {
+	if shardCount <= 1 {
+		return "outbound:" + targetBotID
+	}
+	shard := int(fnv32a(chatID)) % shardCount
+	if shard < 0 {
+		shard += shardCount
+	}
+	return fmt.Sprintf("outbound:%s:shard:%d", targetBotID, shard)
 }
 
 func (c *Client) SentMessage(resp APIResponse) (SentMessage, bool) {

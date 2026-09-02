@@ -47,7 +47,7 @@ func (s *scriptRoundTripper) calls() int {
 
 func newE2EClient(t *testing.T, rt *scriptRoundTripper, th Throttler) (*Client, *queueHarness) {
 	t.Helper()
-	client, err := NewClient("test-token", 5*time.Second, "", "test", th)
+	client, err := NewClient("test-token", 5*time.Second, "", "test", th, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -159,7 +159,7 @@ func TestCallDirectParsesFloodResponse(t *testing.T) {
 // TestNetworkErrorSurfacesAsResult verifies transport failures do not panic or
 // hang the caller; they surface as an error from callDirect.
 func TestNetworkErrorSurfacesAsResult(t *testing.T) {
-	client, err := NewClient("t", time.Second, "", "main", nil)
+	client, err := NewClient("t", time.Second, "", "main", nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

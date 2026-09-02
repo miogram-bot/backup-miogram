@@ -75,8 +75,9 @@ func (q *Queue) EnqueueOutbound(ctx context.Context, botID string, payload []byt
 	return q.client.RPush(ctx, "outbound:"+botID, payload).Err()
 }
 
-func (q *Queue) DequeueOutbound(ctx context.Context, botID string, timeout time.Duration) ([]byte, error) {
-	result, err := q.client.BLPop(ctx, timeout, "outbound:"+botID).Result()
+func (q *Queue) DequeueOutbound(ctx context.Context, botID string, shardIndex int, timeout time.Duration) ([]byte, error) {
+	key := fmt.Sprintf("outbound:%s:shard:%d", botID, shardIndex)
+	result, err := q.client.BLPop(ctx, timeout, key).Result()
 	if errors.Is(err, redis.Nil) {
 		return nil, nil
 	}
@@ -310,9 +311,35 @@ func (q *Queue) ReleaseLeaderLock(ctx context.Context, token string) error {
 	return q.client.Eval(ctx, releaseLeaderScript, []string{leaderKey}, token).Err()
 }
 
-// OutboundQueueLen reports how many API jobs wait in a bot's outbound queue.
+// OutboundQueueLen reports the total depth of a bot's outbound queues
+// (legacy key + all sharded keys).
 func (q *Queue) OutboundQueueLen(ctx context.Context, botID string) (int64, error) {
-	return q.client.LLen(ctx, "outbound:"+botID).Result()
+	var total int64
+	n, err := q.client.LLen(ctx, "outbound:"+botID).Result()
+	if err != nil {
+		return 0, err
+	}
+	total += n
+	prefix := "outbound:" + botID + ":shard:"
+	var cursor uint64
+	for {
+		keys, nextCursor, scanErr := q.client.Scan(ctx, cursor, prefix+"*", 100).Result()
+		if scanErr != nil {
+			break
+		}
+		for _, k := range keys {
+			ln, lerr := q.client.LLen(ctx, k).Result()
+			if lerr != nil {
+				continue
+			}
+			total += ln
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	return total, nil
 }
 
 // ---------- توابع بار ربات‌ها ----------

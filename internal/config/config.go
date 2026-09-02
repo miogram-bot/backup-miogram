@@ -63,9 +63,10 @@ type Config struct {
 	PendingAttempts int           // fallback delivery attempts before dropping + notifying sender
 	LeaderLease     time.Duration
 	HeartbeatTTL    time.Duration
-	HeartbeatEvery  time.Duration
-	ModeReconcile   time.Duration
-	SuggestCooldown time.Duration
+	HeartbeatEvery    time.Duration
+	ModeReconcile     time.Duration
+	SuggestCooldown   time.Duration
+	OutboundShardCount int
 }
 
 func Load() (Config, error) {
@@ -151,6 +152,10 @@ func Load() (Config, error) {
 	cfg.HeartbeatEvery = envDuration("HEARTBEAT_EVERY", 15*time.Second)
 	cfg.ModeReconcile = envDuration("MODE_RECONCILE", 10*time.Second)
 	cfg.SuggestCooldown = envDuration("SUGGEST_COOLDOWN", 6*time.Hour)
+	cfg.OutboundShardCount = envInt("OUTBOUND_SHARD_COUNT", 1)
+	if cfg.OutboundShardCount < 1 {
+		cfg.OutboundShardCount = 1
+	}
 	return cfg, nil
 }
 

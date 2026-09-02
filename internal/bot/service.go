@@ -564,7 +564,7 @@ func (s *Service) notifyMovedBack(ctx context.Context, userID string) {
 			"✅ ربات قبلی موقتاً غیرفعال بود؛ گفتگوی شما به ربات اصلی منتقل شد.\n" +
 			"https://t.me/" + mainUsername,
 		"disable_web_page_preview": true,
-	})
+	}, s.cfg.OutboundShardCount)
 }
 
 // fromUserParam is an internal marker threaded through send() params so the
@@ -707,7 +707,7 @@ func (s *Service) StartLoadMonitoring(ctx context.Context, q *queue.Queue) {
 			if q == nil {
 				continue
 			}
-			queueLen, err := q.Client().LLen(ctx, "outbound:"+s.cfg.BotID).Result()
+			queueLen, err := q.OutboundQueueLen(ctx, s.cfg.BotID)
 			if err != nil {
 				log.Printf("load monitor: %v", err)
 				continue

@@ -530,7 +530,7 @@ func (m *Manager) notifySender(ctx context.Context, job queue.PendingJob, reason
 		_ = telegram.EnqueueOutbound(ctx, m.q.Client(), targetBot, "sendMessage", map[string]any{
 			"chat_id": job.FromUserID,
 			"text":    text,
-		})
+		}, m.cfg.OutboundShardCount)
 	}
 }
 
@@ -764,7 +764,7 @@ func (m *Manager) notifyReturnToMain(ctx context.Context, userID, helper string)
 		"chat_id":                  userID,
 		"text":                     text,
 		"disable_web_page_preview": true,
-	}); err != nil {
+	}, m.cfg.OutboundShardCount); err != nil {
 		log.Printf("fleet: notify return-to-main %s: %v", userID, err)
 	}
 }
