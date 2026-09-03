@@ -35,6 +35,7 @@ type Client struct {
 	queueStart  sync.Once
 	botID       string
 	shardCount  int
+	queueCount  int64
 }
 
 // Throttler gates outbound sends. fleet.Limiter implements it with an AIMD
@@ -96,7 +97,12 @@ func (c *Client) CallViaBot(ctx context.Context, targetBotID, method string, par
 
 func (c *Client) callViaQueue(ctx context.Context, targetBotID, method string, params map[string]any) (APIResponse, error) {
 	if c.redis == nil {
+		log.Printf("redis-queue: FALLBACK callDirect bot=%s method=%s (redis is nil)", c.botID, method)
 		return c.callDirect(ctx, method, params)
+	}
+	c.queueCount++
+	if c.queueCount%100 == 1 {
+		log.Printf("redis-queue: bot=%s method=%s via-redis count=%d shard_count=%d", c.botID, method, c.queueCount, c.shardCount)
 	}
 	queueKey := outboundQueueKeyForBot(targetBotID, c.shardCount, extractChatID(params))
 	job, err := newOutboundJob(method, params)
@@ -287,6 +293,8 @@ func (c *Client) runOutboundQueueShard(ctx context.Context, shard int) {
 	} else {
 		queueKey = fmt.Sprintf("outbound:%s:shard:%d", c.botID, shard)
 	}
+	log.Printf("outbound-worker: started bot=%s shard=%d key=%s", c.botID, shard, queueKey)
+	processed := 0
 	for {
 		item, err := c.redis.BLPop(ctx, time.Second, queueKey).Result()
 		if err != nil {
@@ -353,6 +361,10 @@ func (c *Client) runOutboundQueueShard(ctx context.Context, shard int) {
 		pipe.RPush(context.Background(), responseKey, raw)
 		pipe.Expire(context.Background(), responseKey, 5*time.Minute)
 		_, _ = pipe.Exec(context.Background())
+		processed++
+		if processed%100 == 1 {
+			log.Printf("outbound-worker: bot=%s shard=%d processed=%d method=%s ok=%v", c.botID, shard, processed, job.Method, result.Response.Ok)
+		}
 	}
 }
 
