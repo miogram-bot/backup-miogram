@@ -122,32 +122,51 @@ func (s *Service) adminGroupID(ctx context.Context) string {
 	return admin.AdminGroupID
 }
 
+// adminBanUser - مدیریت دکمه بن کاربر از پیام تصویر پروفایل
+// اصلاحات: بررسی وجود کاربر، جلوگیری از بن مجدد، و بازخورد مناسب به ادمین
 func (s *Service) adminBanUser(ctx context.Context, c *UpdateContext) error {
-    userID := part(c.ExData, 1)
-    if userID == "" {
-        return s.answer(ctx, c, "کاربر مشخص نشده است.")
-    }
+	userID := part(c.ExData, 1)
+	if userID == "" {
+		return s.answer(ctx, c, "کاربر مشخص نشده است.")
+	}
 
-    // ۱. کاربر را بلاک کن
-    _, err := s.store.DB().Exec(ctx, `UPDATE users SET status='block' WHERE user_id=$1`, userID)
-    if err != nil {
-        return s.answer(ctx, c, "خطا در بن کاربر.")
-    }
+	// ۱. بررسی وجود کاربر
+	var exists bool
+	err := s.store.DB().QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE user_id=$1)`, userID).Scan(&exists)
+	if err != nil || !exists {
+		return s.answer(ctx, c, "کاربر یافت نشد.")
+	}
 
-    // ۲. به کاربر اطلاع بده
-    _, _ = s.send(ctx, "sendMessage", map[string]any{
-        "chat_id": userID,
-        "text":    "⛔️ حساب شما توسط مدیریت ربات مسدود شد. برای پیگیری می‌توانید از بخش پشتیبانی تیکت ثبت کنید.",
-    })
+	// ۲. به‌روزرسانی وضعیت به بلاک (فقط در صورتی که قبلاً بلاک نباشد)
+	tag, err := s.store.DB().Exec(ctx, `UPDATE users SET status='block' WHERE user_id=$1 AND status != 'block'`, userID)
+	if err != nil {
+		return s.answer(ctx, c, "خطا در بن کاربر.")
+	}
+	if tag.RowsAffected() == 0 {
+		return s.answer(ctx, c, "کاربر قبلاً بلاک شده است.")
+	}
 
-    // ۳. ویرایش پیام ادمین (حذف دکمه و نشان دادن وضعیت)
-    _, err = s.send(ctx, "editMessageCaption", map[string]any{
-        "chat_id":    c.ChatID,
-        "message_id": c.MessageID,
-        "caption":    "🚫 کاربر بن شد.",
-        "reply_markup": telegram.JSON(replyMarkupInline([][]button{})), // دکمه‌ها حذف شوند
-    })
-    return err
+	// ۳. اطلاع‌رسانی به کاربر
+	_, _ = s.send(ctx, "sendMessage", map[string]any{
+		"chat_id": userID,
+		"text":    "⛔️ حساب شما توسط مدیریت ربات مسدود شد. برای پیگیری می‌توانید از بخش پشتیبانی تیکت ثبت کنید.",
+	})
+
+	// ۴. ویرایش پیام ادمین (حذف دکمه‌ها و نمایش وضعیت)
+	_, err = s.send(ctx, "editMessageCaption", map[string]any{
+		"chat_id":    c.ChatID,
+		"message_id": c.MessageID,
+		"caption":    "🚫 کاربر بن شد.",
+		"reply_markup": telegram.JSON(replyMarkupInline([][]button{})),
+	})
+	if err != nil {
+		// در صورت شکست ویرایش، یک پیام جدید ارسال کن تا ادمین مطلع شود
+		_, _ = s.send(ctx, "sendMessage", map[string]any{
+			"chat_id": c.ChatID,
+			"text":    "🚫 کاربر بن شد.",
+		})
+	}
+	return nil
 }
 
 func getUserUniq(ctx context.Context, s *Service, userID string) string {
