@@ -500,64 +500,64 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 		}
 		return true, err
 
-		case "set_image":
-			fileID := photoID(c.Message)
-			if fileID == "" {
-				_, err := s.send(ctx, "sendMessage", map[string]any{
-					"chat_id":             c.UserID,
-					"text":                "⚠️ خطا: ورودی باید بصورت عکس باشد.",
-					"reply_to_message_id": c.MessageID,
-					"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-						{callbackButton("بیخیال ✏️ تغییر عکس", "start")},
-					})),
-				})
-				return true, err
-			}
 
-			// ۱. بلافاصله تصویر را در کاربر ذخیره کن
-			_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
-			if err != nil {
-				return true, err
-			}
-
-			// ۲. ارسال تصویر به گروه ادمین با دکمه بن
-			adminGroupID := s.adminGroupID(ctx)
-			if adminGroupID != "" {
-				_, sendErr := s.send(ctx, "sendPhoto", map[string]any{
-					"chat_id":           adminGroupID,
-					"message_thread_id": adminTopicProfile,
-					"photo":             fileID,
-					"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
-						c.UserID, c.UserID, c.User.UniqID),
-					"parse_mode": "HTML",
-					"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-						{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", c.UserID))},
-					})),
-				})
-				_ = sendErr // خطا را نادیده بگیر (در صورت نیاز لاگ کن)
-			}
-
-			// ۳. به‌روزرسانی مرحله کاربر
-			_ = s.store.UpdateUserStepPrev(ctx, c.UserID, "start", "start")
-			c.User.Step = "start"
-			c.User.PrevStep = "start"
-			c.refreshStep()
-			_ = s.reloadUser(ctx, c)
-
-			// ۴. پیام موفقیت به کاربر (بدون اشاره به تأیید ادمین)
-			_, err = s.send(ctx, "sendMessage", map[string]any{
-				"chat_id":      c.UserID,
-				"text":         "✅ تصویر شما با موفقیت ثبت شد.",
-				"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
+	case "set_image":
+		fileID := photoID(c.Message)
+		if fileID == "" {
+			_, err := s.send(ctx, "sendMessage", map[string]any{
+				"chat_id":             c.UserID,
+				"text":                "⚠️ خطا: ورودی باید بصورت عکس باشد.",
+				"reply_to_message_id": c.MessageID,
+				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+					{callbackButton("بیخیال ✏️ تغییر عکس", "start")},
+				})),
 			})
-			if err != nil {
-				return true, err
-			}
-
-			// ۵. اهدای سکه در صورت تکمیل پروفایل
-			_, err = s.checkProfileCoin(ctx, c)
 			return true, err
+		}
 
+		// ۱. بلافاصله تصویر را در کاربر ذخیره کن
+		_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
+		if err != nil {
+			return true, err
+		}
+
+		// ۲. ارسال تصویر به گروه ادمین با دکمه بن
+		adminGroupID := s.adminGroupID(ctx)
+		if adminGroupID != "" {
+			_, sendErr := s.send(ctx, "sendPhoto", map[string]any{
+				"chat_id":           adminGroupID,
+				"message_thread_id": adminTopicProfile,
+				"photo":             fileID,
+				"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
+					c.UserID, c.UserID, c.User.UniqID),
+				"parse_mode": "HTML",
+				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+					{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", c.UserID))},
+				})),
+			})
+			_ = sendErr // خطا را نادیده بگیر (در صورت نیاز لاگ کن)
+		}
+
+		// ۳. به‌روزرسانی مرحله کاربر
+		_ = s.store.UpdateUserStepPrev(ctx, c.UserID, "start", "start")
+		c.User.Step = "start"
+		c.User.PrevStep = "start"
+		c.refreshStep()
+		_ = s.reloadUser(ctx, c)
+
+		// ۴. پیام موفقیت به کاربر (بدون اشاره به تأیید ادمین)
+		_, err = s.send(ctx, "sendMessage", map[string]any{
+			"chat_id":      c.UserID,
+			"text":         "✅ تصویر شما با موفقیت ثبت شد.",
+			"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
+		})
+		if err != nil {
+			return true, err
+		}
+
+		// ۵. اهدای سکه در صورت تکمیل پروفایل
+		_, err = s.checkProfileCoin(ctx, c)
+		return true, err
 	}
 	return false, nil
 }
