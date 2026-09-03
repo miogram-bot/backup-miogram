@@ -36,7 +36,7 @@ func mainMenuKeyboard(isAdmin bool) [][]button {
 	rows := [][]button{
 		{textButton("🔗 به یه ناشناس وصلم کن!️")},
 		{textButton("🔍 جستجوی کاربران 🔎"), textButton("📍افراد نزدیک")},
-		{textButton("💰سکه"), textButton("👤پروفایل"), textButton("🤔راهنما")},
+		{textButton("💰سکه"), textButton("👤پروفایل"), textButton("👨‍💻پشتیبانی")},
 		{textButton("🚸 معرفی به دوستان (سکه رایگان)")},
 	}
 	if isAdmin {

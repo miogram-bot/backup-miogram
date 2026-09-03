@@ -280,7 +280,7 @@ func (s *Service) handleClassroomChoice(ctx context.Context, c *UpdateContext) e
 	_ = s.store.UpdateUserStep(ctx, c.UserID, "start")
 	_, err := s.send(ctx, "sendMessage", map[string]any{
 		"chat_id":      c.UserID,
-		"text":         fmt.Sprintf("✅ شما با موفقیت به کلاس %s منتقل شدید! اکنون می‌توانید از تمام امکانات ربات استفاده کنید.", targetBotID),
+		"text":         "✅ شما با موفقیت به ربات کمکی منتقل شدید! اکنون می‌توانید از تمام امکانات ربات استفاده کنید.",
 		"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
 	})
 	return err
@@ -939,16 +939,7 @@ func (s *Service) userProfilePhoto(ctx context.Context, user storage.User) any {
     if user.Image == "" {
         return s.defaultProfilePhoto(user.Gender)
     }
-    var status string
-    err := s.store.DB().QueryRow(ctx, `
-        SELECT status FROM profile_reviews 
-        WHERE user_id=$1 AND status='approved' 
-        ORDER BY id DESC LIMIT 1
-    `, user.UserID).Scan(&status)
-    if err == nil && status == "approved" {
-        return user.Image
-    }
-    return s.defaultProfilePhoto(user.Gender)
+    return user.Image
 }
 
 func (s *Service) completeProfile(ctx context.Context, user storage.User) (count int, info string, inline [][]button) {

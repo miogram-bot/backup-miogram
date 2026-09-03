@@ -23,12 +23,12 @@ func (s *Service) handleAdmin(ctx context.Context, c *UpdateContext) (bool, erro
 		}
 		return true, s.answer(ctx, c, "✅ پرداخت مجدداً بررسی و در صورت موفقیت واریز شد.")
 	}
-	if part(c.ExData, 0) == "profile_review" {
-		return true, s.adminReviewProfilePhoto(ctx, c)
-	}
 	if part(c.ExData, 0) == "ticket_reply" {
 		return true, s.startTicketReply(ctx, c)
 	}
+	if part(c.ExData, 0) == "profile_ban" {
+		return true, s.adminBanUser(ctx, c)
+	}	
 	if part(c.ExData, 0) == "card_review" {
 		return true, s.adminReviewCardReceipt(ctx, c)
 	}
@@ -118,117 +118,32 @@ func (s *Service) adminGroupID(ctx context.Context) string {
 	return admin.AdminGroupID
 }
 
-func (s *Service) adminReviewProfilePhoto(ctx context.Context, c *UpdateContext) error {
-	action := part(c.ExData, 1)
-	reviewID := parseInt64(part(c.ExData, 2))
-	if reviewID == 0 || (action != "approve" && action != "reject" && action != "edit") {
-		return s.answer(ctx, c, "درخواست نامعتبر است.")
-	}
+func (s *Service) adminBanUser(ctx context.Context, c *UpdateContext) error {
+    userID := part(c.ExData, 1)
+    if userID == "" {
+        return s.answer(ctx, c, "کاربر مشخص نشده است.")
+    }
 
-	var userID, fileID, status, reviewedBy string
-	var reviewedAt int64
-	err := s.store.DB().QueryRow(ctx, `SELECT user_id,file_id,status,coalesce(reviewed_by,''),reviewed_at FROM profile_reviews WHERE id=$1`, reviewID).Scan(&userID, &fileID, &status, &reviewedBy, &reviewedAt)
-	if err != nil {
-		return s.answer(ctx, c, "این درخواست یافت نشد.")
-	}
+    // ۱. کاربر را بلاک کن
+    _, err := s.store.DB().Exec(ctx, `UPDATE users SET status='block' WHERE user_id=$1`, userID)
+    if err != nil {
+        return s.answer(ctx, c, "خطا در بن کاربر.")
+    }
 
-	if action == "edit" {
-		if status != "approved" && status != "rejected" {
-			return s.answer(ctx, c, "این درخواست هنوز بررسی نشده است.")
-		}
-		// Re-open for review: show approve/reject buttons again
-		_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='pending',reviewed_by='',reviewed_at=0 WHERE id=$1`, reviewID)
-		// Reset user image to pending state
-		_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM profile_reviews WHERE id=$1`, reviewID).Scan(&fileID)
-		_, editErr := s.send(ctx, "editMessageCaption", map[string]any{
-			"chat_id":    c.ChatID,
-			"message_id": c.MessageID,
-			"caption":    fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", userID, userID, getUserUniq(ctx, s, userID)),
-			"parse_mode": "HTML",
-			"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
-				callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
-				callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
-			}})),
-		})
-		_ = s.answer(ctx, c, "وضعیت برای ویرایش باز شد.")
-		return editErr
-	}
+    // ۲. به کاربر اطلاع بده
+    _, _ = s.send(ctx, "sendMessage", map[string]any{
+        "chat_id": userID,
+        "text":    "⛔️ حساب شما توسط مدیریت ربات مسدود شد. برای پیگیری می‌توانید از بخش پشتیبانی تیکت ثبت کنید.",
+    })
 
-	// Normal approve/reject flow
-	targetUser, userErr := s.store.UserByID(ctx, userID)
-	if userErr != nil {
-		return userErr
-	}
-
-	adminUsername := c.UserID
-	if c.Username != "" {
-		adminUsername = c.Username
-	}
-
-	statusText := "رد"
-	statusIcon := "❌"
-	statusDB := "rejected"
-	if action == "approve" {
-		statusText = "تایید"
-		statusIcon = "✅"
-		statusDB = "approved"
-	}
-
-	newStatus := statusDB
-	tx, err := s.store.DB().Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	tag, err := tx.Exec(ctx, `UPDATE profile_reviews SET status=$2,reviewed_by=$3,reviewed_at=$4 WHERE id=$1 AND status='pending'`, reviewID, newStatus, c.UserID, c.Now)
-	if err != nil || tag.RowsAffected() == 0 {
-		return s.answer(ctx, c, "این درخواست قبلاً بررسی شده است.")
-	}
-	if action == "approve" {
-		if _, err = tx.Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, userID, fileID); err != nil {
-			return err
-		}
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return err
-	}
-
-	// Update admin group message with final status
-	caption := fmt.Sprintf("🫪 وضعیت: %s %s\n👮‍♂️ادمین: %s",
-		statusIcon, statusText, adminUsername)
-	_, _ = s.send(ctx, "editMessageCaption", map[string]any{
-		"chat_id":    c.ChatID,
-		"message_id": c.MessageID,
-		"caption":    caption,
-		"parse_mode": "HTML",
-		"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
-			callbackButton("ویرایش وضعیت فعلی", fmt.Sprintf("profile_review;edit;%d", reviewID)),
-		}})),
-	})
-
-	// Notify the user
-	if action == "reject" {
-		_ = s.store.UpdateUserStep(ctx, userID, "profile;edit;set_image")
-		_, _ = s.send(ctx, "sendMessage", map[string]any{
-			"chat_id": userID,
-			"text":    "❌ عکس پروفایل شما توسط مدیریت تأیید نشد. لطفاً عکس مناسب دیگری ارسال کنید.",
-		})
-		_ = s.answer(ctx, c, "عکس رد شد.")
-	} else {
-		_, _ = s.send(ctx, "sendMessage", map[string]any{
-			"chat_id": userID,
-			"text":    "✅ عکس پروفایل شما توسط مدیریت تأیید شد.",
-		})
-		targetContext := *c
-		targetContext.UserID = userID
-		targetContext.ChatID = userID
-		targetContext.User = targetUser
-		_, _ = s.checkProfileCoin(ctx, &targetContext)
-		_ = s.answer(ctx, c, "عکس تأیید شد.")
-	}
-
-	return nil
+    // ۳. ویرایش پیام ادمین (حذف دکمه و نشان دادن وضعیت)
+    _, err = s.send(ctx, "editMessageCaption", map[string]any{
+        "chat_id":    c.ChatID,
+        "message_id": c.MessageID,
+        "caption":    "🚫 کاربر بن شد.",
+        "reply_markup": telegram.JSON(replyMarkupInline([][]button{})), // دکمه‌ها حذف شوند
+    })
+    return err
 }
 
 func getUserUniq(ctx context.Context, s *Service, userID string) string {
