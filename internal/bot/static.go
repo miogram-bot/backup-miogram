@@ -14,9 +14,6 @@ import (
 )
 
 func (s *Service) handleStatic(ctx context.Context, c *UpdateContext) (bool, error) {
-	if c.Data == "stay_classroom" {
-		return true, s.handleStayClassroom(ctx, c)
-	}
 	if strings.HasPrefix(c.Text, "/delete_messages_") || strings.HasPrefix(c.Text, "/delet_messages_") {
 		return true, s.deleteEndedConversation(ctx, c)
 	}
