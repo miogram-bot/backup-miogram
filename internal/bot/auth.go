@@ -160,7 +160,7 @@ func (s *Service) handleAuth(ctx context.Context, c *UpdateContext) (handled boo
 	}
 
 	if c.UserID != s.cfg.AdminID && c.User.Status == "block" && c.Text != SupportButton && c.Text != "/support" && part(c.ExStep, 0) != "support" {
-		_, _ = s.send(ctx, "sendMessage", map[string]any{"chat_id": c.UserID, "text": "⛔️ حساب شما مسدود است. برای پیگیری از گزینه «📨 ارسال پیام به پشتیبانی» استفاده کنید.", "reply_markup": telegram.JSON(replyMarkupKeyboard([][]button{{textButton(SupportButton)}}))})
+		_, _ = s.send(ctx, "sendMessage", map[string]any{"chat_id": c.UserID, "text": "⛔️ حساب شما مسدود است. برای پیگیری از گزینه «📨 پشتیبانی» استفاده کنید.", "reply_markup": telegram.JSON(replyMarkupKeyboard([][]button{{textButton(SupportButton)}}))})
 		return true, true, nil
 	}
 

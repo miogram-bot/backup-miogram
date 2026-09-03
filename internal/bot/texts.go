@@ -6,7 +6,7 @@ const (
 	PanelButton       = "👨‍💻 پنل ادمین"
 	EndChatButton     = "پایان چت"
 	ShowProfileButton = "👀مشاهده پروفایل این مخاطب👤"
-	SupportButton     = "📨 ارسال پیام به پشتیبانی"
+	SupportButton     = "📨 پشتیبانی"
 	PrivateChatButton = "🔒 تغییر حالت خصوصی"
 	TicTacToeButton   = "🎮 بازی دوز"
 
@@ -23,7 +23,7 @@ var BotButtons = map[string]bool{
 	"📍افراد نزدیک":                   true,
 	"💰سکه":                           true,
 	"👤پروفایل":                       true,
-	"👨‍💻پشتیبانی":                        true,
+	"🤔راهنما":                        true,
 	"🚸 معرفی به دوستان (سکه رایگان)": true,
 	PrivateChatButton:                true,
 	TicTacToeButton:                  true,

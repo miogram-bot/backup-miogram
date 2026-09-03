@@ -181,7 +181,7 @@ func (s *Scheduler) endDueFakeChats(ctx context.Context, now int64) error {
 		mainMenuKeyboard := [][]bot.Button{
 			{{"text": "🔗 به یه ناشناس وصلم کن!️"}},
 			{{"text": "🔍 جستجوی کاربران 🔎"}, {"text": "📍افراد نزدیک"}},
-			{{"text": "💰سکه"}, {"text": "👤پروفایل"}, {"text": "👨‍💻پشتیبانی"}},
+			{{"text": "💰سکه"}, {"text": "👤پروفایل"}, {"text": "🤔راهنما"}},
 			{{"text": "🚸 معرفی به دوستان (سکه رایگان)"}},
 		}
 		_, err = s.botSvc.SendMessageWithRoutingAndKeyboard(ctx, item.realID, text, mainMenuKeyboard)

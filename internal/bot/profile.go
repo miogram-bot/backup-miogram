@@ -499,104 +499,66 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			_, err = s.checkProfileCoin(ctx, c)
 		}
 		return true, err
-	case "set_image":
-		completingProfile := c.User.PrevStep == "complete_profile"
-		fileID := photoID(c.Message)
-		if fileID == "" {
-			_, err := s.send(ctx, "sendMessage", map[string]any{
-				"chat_id":             c.UserID,
-				"text":                "⚠️ خطا: ورودی باید بصورت عکس باشد.",
-				"reply_to_message_id": c.MessageID,
-				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-					{callbackButton("بیخیال ✏️ تغییر عکس", "start")},
-				})),
+
+		case "set_image":
+			completingProfile := c.User.PrevStep == "complete_profile"
+			fileID := photoID(c.Message)
+			if fileID == "" {
+				_, err := s.send(ctx, "sendMessage", map[string]any{
+					"chat_id":             c.UserID,
+					"text":                "⚠️ خطا: ورودی باید بصورت عکس باشد.",
+					"reply_to_message_id": c.MessageID,
+					"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+						{callbackButton("بیخیال ✏️ تغییر عکس", "start")},
+					})),
+				})
+				return true, err
+			}
+
+			// ۱. بلافاصله تصویر را در کاربر ذخیره کن
+			_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
+			if err != nil {
+				return true, err
+			}
+
+			// ۲. ارسال تصویر به گروه ادمین با دکمه بن
+			adminGroupID := s.adminGroupID(ctx)
+			if adminGroupID != "" {
+				_, sendErr := s.send(ctx, "sendPhoto", map[string]any{
+					"chat_id":           adminGroupID,
+					"message_thread_id": adminTopicProfile,
+					"photo":             fileID,
+					"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
+						c.UserID, c.UserID, c.User.UniqID),
+					"parse_mode": "HTML",
+					"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+						{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", c.UserID))},
+					})),
+				})
+				_ = sendErr // خطا را نادیده بگیر (در صورت نیاز لاگ کن)
+			}
+
+			// ۳. به‌روزرسانی مرحله کاربر
+			_ = s.store.UpdateUserStepPrev(ctx, c.UserID, "start", "start")
+			c.User.Step = "start"
+			c.User.PrevStep = "start"
+			c.refreshStep()
+			_ = s.reloadUser(ctx, c)
+
+			// ۴. پیام موفقیت به کاربر (بدون اشاره به تأیید ادمین)
+			_, err = s.send(ctx, "sendMessage", map[string]any{
+				"chat_id":      c.UserID,
+				"text":         "✅ تصویر شما با موفقیت ثبت شد.",
+				"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
 			})
-			return true, err
-		}
-		_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='superseded' WHERE user_id=$1 AND status='pending'`, c.UserID)
-		var reviewID int64
-		err := s.store.DB().QueryRow(ctx, `INSERT INTO profile_reviews (user_id,file_id,status,created_at) VALUES ($1,$2,'pending',$3) RETURNING id`, c.UserID, fileID, c.Now).Scan(&reviewID)
-		if err != nil {
-			return true, err
-		}
-
-		// Send to admin group topic 50
-		adminGroupID := s.adminGroupID(ctx)
-		var resp telegram.APIResponse
-		var sendErr error
-		if adminGroupID != "" {
-			resp, sendErr = s.send(ctx, "sendPhoto", map[string]any{
-				"chat_id":           adminGroupID,
-				"message_thread_id": adminTopicProfile,
-				"photo":             fileID,
-				"caption":           fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", c.UserID, c.UserID, c.User.UniqID),
-				"parse_mode":        "HTML",
-				"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
-					callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
-					callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
-				}})),
-			})
-		}
-		if adminGroupID == "" || sendErr != nil || !resp.Ok {
-			// Fallback to support group or admin
-			fallbackChatID := c.Admin.Support
-			if fallbackChatID == "" {
-				fallbackChatID = s.cfg.AdminID
+			if err != nil {
+				return true, err
 			}
-			fallbackParams := map[string]any{
-				"chat_id":    fallbackChatID,
-				"photo":      fileID,
-				"caption":    fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", c.UserID, c.UserID, c.User.UniqID),
-				"parse_mode": "HTML",
-				"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
-					callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
-					callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
-				}})),
-			}
-			if fallbackChatID == c.Admin.AdminGroupID {
-				fallbackParams["message_thread_id"] = adminTopicProfile
-			}
-			resp, sendErr = s.send(ctx, "sendPhoto", fallbackParams)
-			if sendErr != nil || !resp.Ok {
-				_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='send_failed' WHERE id=$1`, reviewID)
-				if sendErr != nil {
-					return true, fmt.Errorf("send profile review: %w", sendErr)
-				}
-				return true, fmt.Errorf("send profile review failed")
-			}
-		}
-		if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
-			cachedID := msg.Photo[len(msg.Photo)-1].FileID
-			_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET file_id=$2,message_id_admin=$3 WHERE id=$1`, reviewID, cachedID, msg.MessageID)
-		}
 
-		// Store the image in users table immediately so profile shows as complete
-		_, _ = s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
-
-		_ = s.store.UpdateUserStepPrev(ctx, c.UserID, "start", "start")
-		c.User.Step = "start"
-		c.User.PrevStep = "start"
-		c.refreshStep()
-
-		// Reload user to update Image field
-		_ = s.reloadUser(ctx, c)
-
-		_, err = s.send(ctx, "sendMessage", map[string]any{
-			"chat_id":      c.UserID,
-			"text":         "✅ عکس شما دریافت شد و پس از تأیید مدیریت در پروفایل نمایش داده می‌شود.\n\n💡 پروفایل شما تکمیل شد و ۵ سکه جایزه دریافت کردید!",
-			"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
-		})
-
-		// Check and award profile completion coin
-		if err == nil {
+			// ۵. اهدای سکه در صورت تکمیل پروفایل
 			_, err = s.checkProfileCoin(ctx, c)
-		}
+			return true, err
 
-		// If profile was being completed and location is missing, ask for GPS
-		if err == nil && completingProfile && c.User.Latitude == 0 {
-			err = s.askProfileGPS(ctx, c)
-		}
-		return true, err
 	}
 	return false, nil
 }
