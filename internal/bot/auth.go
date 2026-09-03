@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"miogram/internal/fleet"
 	"miogram/internal/telegram"
 )
 
@@ -290,6 +291,16 @@ func (s *Service) handleOnboarding(ctx context.Context, c *UpdateContext) (bool,
 				return false, true, err
 			}
 			_ = s.reloadUser(ctx, c)
+
+			// PEAK mode: registration is complete. Send ONLY the migration
+			// message. The original message that triggered registration is
+			// IGNORED (not processed, not stored, no response).
+			if s.fleet != nil && s.fleet.Mode() == fleet.ModePeak && s.cfg.BotID == s.cfg.MainBotID {
+				if err := s.sendMigrationToHelper(ctx, c); err != nil {
+					return false, true, err
+				}
+				return true, true, nil
+			}
 
 			_, _ = s.send(ctx, "sendMessage", map[string]any{
 				"chat_id":             c.UserID,
