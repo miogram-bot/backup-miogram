@@ -90,26 +90,25 @@ func (s *Service) Process(ctx context.Context, up telegram.Update, botID string)
 		return err
 	}
 
+	// PEAK interception for registered users: when the main bot is in peak
+	// mode and the user is already registered (gender, age, state all set),
+	// send ONLY the migration message. The original message is IGNORED.
+	if s.fleet != nil && s.fleet.Mode() == fleet.ModePeak && s.cfg.BotID == s.cfg.MainBotID {
+		if c.User.UserID != "" && c.User.Gender != "" && c.User.Age > 0 && c.User.State != "" {
+			return s.sendMigrationToHelper(ctx, &c)
+		}
+	}
+
 	handled, stop, err := s.handleAuth(ctx, &c)
 	if err != nil || stop || handled {
 		return err
 	}
 
-	// Classroom-selection guard + capacity-driven redirect (new flow).
-	// While a user is choosing a shard, only the deep link (handled in
-	// handleAuth) and the "stay_classroom" callback (handled in handleStatic)
-	// are honoured; every other input is ignored so the choice screen stays
-	// clean.
-	if c.User.Step == "choose_classroom" && c.BotID == s.cfg.MainBotID {
-		if c.Message != nil && c.Message.Text != "" {
-			return nil
-		}
-		if c.Callback != nil && c.Data != "stay_classroom" {
-			return s.answer(ctx, &c, "لطفاً یکی از کلاس‌ها را انتخاب کنید یا روی «می‌خواهم در کلاس اصلی بمانم» کلیک کنید.")
-		}
-	}
+	// Capacity-driven redirect: when the main bot queue is full during peak
+	// mode, send a single direct migration link via consistent hashing.
+	// Never show a list of helpers — always ONE link to ONE helper.
 	if s.shouldRedirectToClassroom(ctx, &c) {
-		return s.presentClassroomChoice(ctx, &c)
+		return s.sendMigrationToHelper(ctx, &c)
 	}
 
 	if c.User.UserID == "" {
@@ -216,12 +215,10 @@ func (s *Service) afterUserOnline(ctx context.Context, c *UpdateContext) error {
 	return nil
 }
 
-// shouldRedirectToClassroom reports whether an idle (non-chatting) user on the
-// main bot should be offered the classroom-selection screen because the main
-// bot is at capacity. Chatting users are always protected and never prompted.
-// Once a user is already in the choose_classroom state we must not re-present
-// the screen on every subsequent message (the guard in Process suppresses all
-// other input while choosing).
+// shouldRedirectToClassroom reports whether a user on the main bot should be
+// offered a migration link because the main bot is at capacity during peak
+// mode. Sends a single direct link via consistent hashing — never a list.
+// Chatting users are always protected and never prompted.
 func (s *Service) shouldRedirectToClassroom(ctx context.Context, c *UpdateContext) bool {
 	if s.cfg.BotID != s.cfg.MainBotID {
 		return false
@@ -229,10 +226,10 @@ func (s *Service) shouldRedirectToClassroom(ctx context.Context, c *UpdateContex
 	if s.fleet == nil || s.redis == nil {
 		return false
 	}
-	if strings.HasPrefix(c.User.Step, "chatting;") {
+	if s.fleet.Mode() == fleet.ModeOffPeak {
 		return false
 	}
-	if c.User.Step == "choose_classroom" {
+	if strings.HasPrefix(c.User.Step, "chatting;") {
 		return false
 	}
 	queueLen, err := s.redis.OutboundQueueLen(ctx, s.cfg.MainBotID)
@@ -242,44 +239,10 @@ func (s *Service) shouldRedirectToClassroom(ctx context.Context, c *UpdateContex
 	return queueLen >= int64(s.cfg.PeakQueueLen) || s.fleet.Flooded()
 }
 
-// presentClassroomChoice shows the user a menu of shard deep links plus a
-// "stay on main" option. The user picks where to go; nothing else is acted on
-// while they are in the choose_classroom state.
-func (s *Service) presentClassroomChoice(ctx context.Context, c *UpdateContext) error {
-	if err := s.store.UpdateUserStep(ctx, c.UserID, "choose_classroom"); err != nil {
-		return err
-	}
-	var buttons [][]button
-	for _, helperID := range s.getHelperIDs() {
-		username := s.fleet.HelperUsername(helperID)
-		if username == "" {
-			continue
-		}
-		link := "https://t.me/" + strings.TrimPrefix(username, "@") + "?start=classroom_" + c.UserID
-		buttons = append(buttons, []button{urlButton(
-			fmt.Sprintf("📚 کلاس %s", helperID),
-			link,
-		)})
-	}
-	buttons = append(buttons, []button{callbackButton("⏳ می‌خواهم در کلاس اصلی بمانم", "stay_classroom")})
-	_, err := s.send(ctx, "sendMessage", map[string]any{
-		"chat_id": c.UserID,
-		"text": "⚠️ **کلاس اصلی پر شده است!**\n\n" +
-			"سلام کاربر عزیز،\n\n" +
-			"کلاس اصلی ربات (کلاس ۱) به ظرفیت کامل رسیده است. برای ادامه استفاده از ربات، لطفاً یکی از کلاس‌های زیر را انتخاب کنید:\n\n" +
-			"📌 هر کلاس کاملاً مشابه کلاس اصلی است و تمام امکانات را دارد.\n\n" +
-			"⏳ اگر ترجیح می‌دهید در کلاس اصلی بمانید، روی گزینه «می‌خواهم در کلاس اصلی بمانم» کلیک کنید و منتظر بمانید تا ظرفیت آزاد شود.\n\n" +
-			"با تشکر از صبر و همراهی شما!",
-		"parse_mode":   "Markdown",
-		"reply_markup": telegram.JSON(replyMarkupInline(buttons)),
-	})
-	return err
-}
-
-// handleClassroomChoice is invoked by the /start classroom_<id> deep link that
-// the user clicks from presentClassroomChoice. The link embeds the user's
-// Telegram ID (stable across every bot instance) so it verifies correctly on
-// the target shard — unlike UniqID, which differs per bot.
+// handleClassroomChoice is invoked by the /start classroom_<id> deep link.
+// The link embeds the user's Telegram ID (stable across every bot instance)
+// so it verifies correctly on the target shard — unlike UniqID, which differs
+// per bot.
 func (s *Service) handleClassroomChoice(ctx context.Context, c *UpdateContext) error {
 	payload := strings.TrimPrefix(c.Text, "/start classroom_")
 	if payload == "" {
@@ -323,28 +286,6 @@ func (s *Service) handleClassroomChoice(ctx context.Context, c *UpdateContext) e
 	return err
 }
 
-// handleStayClassroom lets a user opt to remain on the main bot despite the
-// capacity prompt, registering a cooldown so they are not re-prompted.
-func (s *Service) handleStayClassroom(ctx context.Context, c *UpdateContext) error {
-	if s.redis != nil {
-		ok, err := s.redis.Client().SetNX(ctx, "fleet:stayclassroom:"+c.UserID, 1, 15*time.Minute).Result()
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return s.answer(ctx, c, "شما قبلاً درخواست ماندن در کلاس اصلی را داده‌اید. لطفاً ۱۵ دقیقه صبر کنید.")
-		}
-	}
-	_ = s.store.UpdateUserStep(ctx, c.UserID, "start")
-	s.deleteMessage(ctx, c.UserID, c.MessageID)
-	_, err := s.send(ctx, "sendMessage", map[string]any{
-		"chat_id":      c.UserID,
-		"text":         "✅ درخواست شما ثبت شد. به محض آزاد شدن ظرفیت در کلاس اصلی، به شما اطلاع داده می‌شود.",
-		"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
-	})
-	return err
-}
-
 // getHelperIDs returns the configured helper bot IDs in a stable order.
 func (s *Service) getHelperIDs() []string {
 	helpers := make([]string, 0, len(s.cfg.Helpers))
@@ -361,9 +302,20 @@ func (s *Service) getHelperIDs() []string {
 // Active-chat protection: a user mid-conversation is NOT bounced — their chat
 // continues on this helper until it ends ("never force-move a chatting user").
 // The very next update after end-chat triggers the bounce.
+//
+// Routing-aware: if the user's routing already points to this helper, the
+// bounce is skipped even if they are not chatting — they belong here.
 func (s *Service) bounceToMain(ctx context.Context, c *UpdateContext) error {
 	if s.userIsChatting(ctx, c.UserID) {
 		return nil
+	}
+	// If the user's routing is already set to this helper, they belong here
+	// — no bounce needed. This prevents bouncing chatting users whose routing
+	// wasn't updated after migration.
+	if s.redis != nil && c.UserID != "" {
+		if routed, err := s.redis.GetUserBot(ctx, c.UserID); err == nil && routed == c.BotID {
+			return nil
+		}
 	}
 	if s.redis != nil && c.UserID != "" {
 		if _, err := s.redis.MoveUserBot(ctx, c.UserID, s.cfg.MainBotID); err != nil {
@@ -567,6 +519,30 @@ func (s *Service) notifyMovedBack(ctx context.Context, userID string) {
 	}, s.cfg.OutboundShardCount)
 }
 
+// sendMigrationToHelper sends the PEAK-mode migration message to the user.
+// The original message that triggered this is IGNORED.
+// The link uses classroom_ method and consistent-hash helper selection.
+func (s *Service) sendMigrationToHelper(ctx context.Context, c *UpdateContext) error {
+	if s.fleet == nil || len(s.cfg.Helpers) == 0 {
+		return nil
+	}
+	helper := s.fleet.AssignHelper(c.UserID)
+	username := s.fleet.HelperUsername(helper)
+	if username == "" {
+		return nil
+	}
+	link := "https://t.me/" + strings.TrimPrefix(username, "@") + "?start=classroom_" + c.UserID
+	_, err := s.send(ctx, "sendMessage", map[string]any{
+		"chat_id": c.UserID,
+		"text": "🤖 پیام سیستم 👇\n\n" +
+			"⚠️ ربات اصلی در ساعات پرترافیک قرار دارد. برای ادامه بدون وقفه و دریافت پیام‌ها از ربات کمکی استفاده کنید 👇",
+		"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+			{urlButton("🚀 انتقال به ربات کمکی", link)},
+		})),
+	})
+	return err
+}
+
 // fromUserParam is an internal marker threaded through send() params so the
 // pending queue knows who originally sent a relayed chat message (used by the
 // Case C timeout fallback to notify the sender). It is stripped before any
@@ -646,7 +622,8 @@ func isSendMethod(method string) bool {
 }
 
 // suggestMigrationIfNeeded proactively offers the consistent-hash helper
-// during peak hours once per cooldown window per user.
+// during peak hours once per cooldown window per user. In OFFPEAK mode this
+// is a no-op: main handles all users unconditionally.
 func (s *Service) suggestMigrationIfNeeded(ctx context.Context, c *UpdateContext) {
 	if s.fleet == nil || s.redis == nil || s.cfg.IsHelper() {
 		// Only the main bot suggests moving to helpers.
@@ -722,7 +699,11 @@ func (s *Service) StartLoadMonitoring(ctx context.Context, q *queue.Queue) {
 }
 
 // maybeRedirectNewUser assigns brand-new users to their consistent-hash helper
-// whenever the main bot is under pressure (peak mode or active flood limiting).
+// whenever the main bot is under pressure (active flood limiting only).
+//
+// In PEAK mode, new users are NOT redirected — they must complete registration
+// first. After registration, the PEAK interception in Process() sends the
+// migration message.
 func (s *Service) maybeRedirectNewUser(ctx context.Context, c *UpdateContext) (bool, error) {
 	// فقط برای کاربران جدید (هنوز در دیتابیس ثبت نشده‌اند)
 	if c.User.UserID != "" || s.fleet == nil || s.redis == nil || s.cfg.IsHelper() {
@@ -731,7 +712,13 @@ func (s *Service) maybeRedirectNewUser(ctx context.Context, c *UpdateContext) (b
 	if len(s.cfg.Helpers) == 0 {
 		return false, nil
 	}
-	if s.fleet.Mode() != fleet.ModePeak && !s.fleet.Flooded() {
+	// In PEAK mode, new users must complete registration first. The migration
+	// message is sent after registration completes (see Process()).
+	if s.fleet.Mode() == fleet.ModePeak {
+		return false, nil
+	}
+	// Only redirect during active flood limiting (not general peak mode).
+	if !s.fleet.Flooded() {
 		return false, nil
 	}
 	targetBot := s.fleet.AssignHelper(c.UserID)
@@ -740,7 +727,7 @@ func (s *Service) maybeRedirectNewUser(ctx context.Context, c *UpdateContext) (b
 		return false, nil
 	}
 
-	link := "https://t.me/" + targetUsername + "?start=migrate"
+	link := "https://t.me/" + targetUsername + "?start=classroom_" + c.UserID
 	_, err := s.send(ctx, "sendMessage", map[string]any{
 		"chat_id": c.UserID,
 		"text":    "⚠️ ربات اصلی موقتاً شلوغ است. برای ادامه از ربات زیر استفاده کنید 👇",
