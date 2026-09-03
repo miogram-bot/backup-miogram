@@ -501,6 +501,7 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 		return true, err
 
 		case "set_image":
+			completingProfile := c.User.PrevStep == "complete_profile"
 			fileID := photoID(c.Message)
 			if fileID == "" {
 				_, err := s.send(ctx, "sendMessage", map[string]any{
