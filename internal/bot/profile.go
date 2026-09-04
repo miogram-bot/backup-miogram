@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 
@@ -74,29 +75,14 @@ func (s *Service) showSelfProfile(ctx context.Context, c *UpdateContext) error {
 	_ = s.store.DB().QueryRow(ctx, `SELECT count(*) FROM likes WHERE target_id=$1`, c.UserID).Scan(&count)
 	caption := fmt.Sprintf("• نام: %s\n• جنسیت: %s\n• استان: %s\n• شهر: %s\n• سن: %d\n\n♥️ لایک ها : %d\n\n%s\n\n‏🆔 آیدی : /user_%s\n‏",
 		checkInout(c.User.Name), GenderWithEmoji[c.User.Gender], c.User.State, checkInout(c.User.City), c.User.Age, count, lastActivity(c.Now, c.User.LastActivity), c.User.UniqID)
-	resp, err := s.send(ctx, "sendPhoto", map[string]any{
-		"chat_id":             c.UserID,
-		"photo":               s.userProfilePhoto(ctx, c.User),
-		"caption":             caption,
-		"reply_to_message_id": c.MessageID,
-		"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-			{callbackButton("📍مشاهده موقعیت GPS ثبت شده من", "profile;gps_show")},
-			{callbackButton("🙍‍♂️🙎‍♀️ مخاطبین", "contacts;none"), callbackButton("❤️ لایک های من", "likes;none")},
-			{callbackButton("🚫 بلاک شده ها", "blockeds;none"), callbackButton("🔕 سایلنت", "profile;silent;none")},
-			{callbackButton("📝 ویرایش اطلاعات پروفایل", "profile;edit")},
-		})),
-	})
-	if err != nil {
-		return err
-	}
-	if !resp.Ok && c.User.Image != "" {
-		_, _ = s.send(ctx, "sendPhoto", map[string]any{
-			"chat_id":             c.UserID,
-			"photo":               s.defaultProfilePhoto(c.User.Gender),
-			"caption":             caption,
-			"reply_to_message_id": c.MessageID,
-		})
-	}
+	// Routing-aware shared-cache delivery: per-bot file_id, else copyMessage
+	// from the Profile Topic, else gender default. Never uses users.image.
+	_, err := s.sendProfilePhoto(ctx, c.UserID, c.User, caption, telegram.JSON(replyMarkupInline([][]button{
+		{callbackButton("📍مشاهده موقعیت GPS ثبت شده من", "profile;gps_show")},
+		{callbackButton("🙍‍♂️🙎‍♀️ مخاطبین", "contacts;none"), callbackButton("❤️ لایک های من", "likes;none")},
+		{callbackButton("🚫 بلاک شده ها", "blockeds;none"), callbackButton("🔕 سایلنت", "profile;silent;none")},
+		{callbackButton("📝 ویرایش اطلاعات پروفایل", "profile;edit")},
+	})), c.MessageID)
 	countMissing, info, inline := s.completeProfile(ctx, c.User)
 	if countMissing > 0 {
 		_, err = s.send(ctx, "sendMessage", map[string]any{
@@ -126,24 +112,14 @@ func (s *Service) showUserProfile(ctx context.Context, c *UpdateContext, user st
 	if !user.IsFake {
 		_ = s.store.DB().QueryRow(ctx, `SELECT count(*) FROM likes WHERE target_id=$1`, user.UserID).Scan(&likes)
 	}
-	params := map[string]any{
-		"chat_id": c.UserID,
-		"photo":   s.userProfilePhoto(ctx, user),
-		"caption": fmt.Sprintf("• نام: %s\n• جنسیت: %s\n• استان: %s\n• شهر: %s\n• سن: %d\n\n♥️ لایک ها: %d\n\n%s%s\n\n‏🆔 آیدی : /user_%s\n\n\n🏁 فاصله از شما: %s",
-			checkInout(user.Name), GenderWithEmoji[user.Gender], user.State, checkInout(user.City), user.Age, likes, lastActivity(c.Now, user.LastActivity), statusChat, user.UniqID, d),
-		"reply_markup": telegram.JSON(replyMarkupInline(s.generateInlineButtons(ctx, c, user))),
-	}
+	caption := fmt.Sprintf("• نام: %s\n• جنسیت: %s\n• استان: %s\n• شهر: %s\n• سن: %d\n\n♥️ لایک ها: %d\n\n%s%s\n\n‏🆔 آیدی : /user_%s\n\n\n🏁 فاصله از شما: %s",
+		checkInout(user.Name), GenderWithEmoji[user.Gender], user.State, checkInout(user.City), user.Age, likes, lastActivity(c.Now, user.LastActivity), statusChat, user.UniqID, d)
+	replyToID := 0
 	if replyTo {
-		params["reply_to_message_id"] = c.MessageID
+		replyToID = c.MessageID
 	}
-	resp, err := s.send(ctx, "sendPhoto", params)
-	if err != nil {
-		return err
-	}
-	if !resp.Ok && user.Image != "" {
-		params["photo"] = s.defaultProfilePhoto(user.Gender)
-		resp, err = s.send(ctx, "sendPhoto", params)
-	}
+	// Shared-cache delivery (same fallback chain as showSelfProfile).
+	resp, err := s.sendProfilePhoto(ctx, c.UserID, user, caption, telegram.JSON(replyMarkupInline(s.generateInlineButtons(ctx, c, user))), replyToID)
 	if err == nil && resp.Ok {
 		s.notifyProfileView(ctx, c, user)
 	}
@@ -515,27 +491,33 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			return true, err
 		}
 
-		// ۱. بلافاصله تصویر را در کاربر ذخیره کن
+		// ۱. ذخیره فایل‌آیدی خام در users.image (فقط مرجع/لاگ — هرگز مستقیم ارسال نشود)
 		_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
 		if err != nil {
 			return true, err
 		}
 
-		// ۲. ارسال تصویر به گروه ادمین با دکمه بن
+		// ۲. صدور مجدد از طریق Profile Topic: فایل‌آیدیِ پیامِ برگشتی متعلق
+		// به همین بات است و در کش مشترک ذخیره می‌شود. users.image عمداً
+		// به‌روزرسانی نمی‌شود (فقط مرجع می‌ماند).
 		adminGroupID := s.adminGroupID(ctx)
 		if adminGroupID != "" {
-			_, sendErr := s.send(ctx, "sendPhoto", map[string]any{
+			resp, sendErr := s.send(ctx, "sendPhoto", map[string]any{
 				"chat_id":           adminGroupID,
 				"message_thread_id": adminTopicProfile,
 				"photo":             fileID,
-				"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
-					c.UserID, c.UserID, c.User.UniqID),
+				"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nuser_id: %s\nuniq_id: %s\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
+					c.UserID, c.User.UniqID, c.UserID, c.UserID, c.User.UniqID),
 				"parse_mode": "HTML",
 				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
 					{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", c.UserID))},
 				})),
 			})
-			_ = sendErr // خطا را نادیده بگیر (در صورت نیاز لاگ کن)
+			if sendErr != nil {
+				log.Printf("profile set_image: admin topic send user=%s: %v", c.UserID, sendErr)
+			} else if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
+				s.cacheProfilePhoto(ctx, c.UserID, msg.Photo[len(msg.Photo)-1].FileID, msg.MessageID, c.Now)
+			}
 		}
 
 		// ۳. به‌روزرسانی مرحله کاربر

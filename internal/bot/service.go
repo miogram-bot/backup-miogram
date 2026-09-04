@@ -936,10 +936,258 @@ func (s *Service) defaultProfilePhoto(gender string) any {
 }
 
 func (s *Service) userProfilePhoto(ctx context.Context, user storage.User) any {
-    if user.Image == "" {
-        return s.defaultProfilePhoto(user.Gender)
-    }
-    return user.Image
+	// Shared cache only: file_ids in users.image are bot-specific and must
+	// never be used directly (they cause "wrong file identifier" on other
+	// bots). The canonical entry user:<id> holds a file_id re-issued via
+	// the Profile Topic, which every fleet member can resolve through
+	// sendProfilePhoto (per-bot entry or copyMessage fallback).
+	var fileID string
+	if user.UserID != "" {
+		_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetKey(user.UserID)).Scan(&fileID)
+	}
+	if fileID == "" {
+		return s.defaultProfilePhoto(user.Gender)
+	}
+	return fileID
+}
+
+// profileAssetKey is the canonical shared-cache key for a user's profile
+// photo (Step 1.4 / Step 2.1 of the shared-cache design).
+func profileAssetKey(userID string) string {
+	return "user:" + userID
+}
+
+// profileAssetMsgKey stores the Profile Topic message_id for a user's photo.
+// copyMessage(from_chat_id=adminGroup, message_id) works from ANY bot in the
+// group, so it is the truly cross-bot fallback when a cached file_id belongs
+// to a different bot token.
+func profileAssetMsgKey(userID string) string {
+	return "user:" + userID + ":msg"
+}
+
+// profileAssetBotKey stores the per-bot usable file_id for a user's photo.
+// Telegram file_ids are bot-specific: a file_id issued to shard3 cannot be
+// sent by main. Each bot lazily populates its own entry after a successful
+// sendPhoto/copyMessage, so the hot path never hits "wrong file identifier".
+func profileAssetBotKey(userID, botID string) string {
+	return "user:" + userID + ":" + botID
+}
+
+// cacheProfilePhoto stores a Profile Topic re-issue in telegram_assets:
+//   - user:<id>         canonical file_id (spec compliance / observability)
+//   - user:<id>:<botID> per-bot usable file_id for the issuing bot
+//   - user:<id>:msg     Profile Topic message_id for cross-bot copyMessage
+func (s *Service) cacheProfilePhoto(ctx context.Context, userID, fileID string, messageID int, now int64) {
+	if userID == "" || (fileID == "" && messageID == 0) {
+		return
+	}
+	if now == 0 {
+		now = time.Now().Unix()
+	}
+	if fileID != "" {
+		_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
+			profileAssetKey(userID), fileID, now)
+		if s.cfg.BotID != "" {
+			_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
+				profileAssetBotKey(userID, s.cfg.BotID), fileID, now)
+		}
+	}
+	if messageID != 0 {
+		_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
+			profileAssetMsgKey(userID), strconv.Itoa(messageID), now)
+	}
+}
+
+// profilePhotoForBot returns the file_id usable by botID for this user, or "".
+// It prefers the per-bot entry and falls back to the canonical entry (which
+// is only valid if it was issued to botID).
+func (s *Service) profilePhotoForBot(ctx context.Context, userID, botID string) string {
+	if userID == "" {
+		return ""
+	}
+	var fileID string
+	if botID != "" {
+		if err := s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetBotKey(userID, botID)).Scan(&fileID); err == nil && fileID != "" {
+			return fileID
+		}
+	}
+	// Canonical fallback (spec Step 2.2). May still be a foreign bot's
+	// file_id — callers must handle "wrong file identifier" via copyMessage.
+	_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetKey(userID)).Scan(&fileID)
+	return fileID
+}
+
+// sendProfilePhoto delivers a user's profile photo to viewerID, hiding the
+// bot-specific file_id problem:
+//
+//  1. Resolve the bot that will actually execute the send (viewer's routing).
+//  2. Try that bot's per-bot cached file_id via sendPhoto.
+//  3. On miss / "wrong file identifier", copyMessage the Profile Topic
+//     message (works from any bot in the group) and cache the resulting
+//     per-bot file_id for next time.
+//  4. Fall back to the gender default photo.
+//
+// It returns the underlying telegram response (or the default-photo response).
+func (s *Service) sendProfilePhoto(ctx context.Context, viewerID string, target storage.User, caption string, replyMarkup string, replyTo int) (telegram.APIResponse, error) {
+	buildPhotoParams := func(photo any) map[string]any {
+		p := map[string]any{"chat_id": viewerID, "photo": photo, "caption": caption}
+		if replyMarkup != "" {
+			p["reply_markup"] = replyMarkup
+		}
+		if replyTo != 0 {
+			p["reply_to_message_id"] = replyTo
+		}
+		return p
+	}
+
+	// The bot that will execute the API call (routing-aware).
+	targetBot := s.cfg.BotID
+	if viewerID != "" {
+		if resolved, rerr := s.resolveDelivery(ctx, viewerID); rerr == nil && resolved != "" {
+			targetBot = resolved
+		}
+	}
+
+	isWrongFileID := func(resp telegram.APIResponse, err error) bool {
+		if err != nil && strings.Contains(strings.ToLower(err.Error()), "file identifier") {
+			return true
+		}
+		if !resp.Ok && strings.Contains(strings.ToLower(resp.Description), "file identifier") {
+			return true
+		}
+		return false
+	}
+
+	// 1) Per-bot (or canonical) file_id fast path.
+	if fileID := s.profilePhotoForBot(ctx, target.UserID, targetBot); fileID != "" {
+		resp, err := s.send(ctx, "sendPhoto", buildPhotoParams(fileID))
+		if err == nil && resp.Ok {
+			return resp, nil
+		}
+		if !isWrongFileID(resp, err) && (err != nil || !resp.Ok) {
+			// A non-file_id failure (blocked bot, network, ...): surface it
+			// unless it is a deliverability case the caller handles.
+			if err != nil {
+				log.Printf("sendProfilePhoto sendPhoto user=%s viewer=%s bot=%s: %v", target.UserID, viewerID, targetBot, err)
+			}
+		}
+		// Wrong-file-id or empty: fall through to copyMessage. Drop a stale
+		// per-bot entry so the next attempt re-caches.
+		if targetBot != "" {
+			_, _ = s.store.DB().Exec(ctx, `DELETE FROM telegram_assets WHERE name=$1`, profileAssetBotKey(target.UserID, targetBot))
+		}
+	}
+
+	// 2) Cross-bot fallback: copy the Profile Topic message. Any fleet
+	// member in the admin group can copy it, regardless of which bot
+	// originally uploaded the photo.
+	var msgIDStr string
+	_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetMsgKey(target.UserID)).Scan(&msgIDStr)
+	if msgID, convErr := strconv.Atoi(strings.TrimSpace(msgIDStr)); convErr == nil && msgID != 0 {
+		if adminGroupID := s.adminGroupID(ctx); adminGroupID != "" {
+			cp := map[string]any{"chat_id": viewerID, "from_chat_id": adminGroupID, "message_id": msgID, "caption": caption}
+			if replyMarkup != "" {
+				cp["reply_markup"] = replyMarkup
+			}
+			if replyTo != 0 {
+				cp["reply_to_message_id"] = replyTo
+			}
+			if resp, err := s.send(ctx, "copyMessage", cp); err == nil && resp.Ok {
+				// copyMessage returns the new message; harvest this bot's
+				// own file_id for the hot path next time.
+				if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
+					now := time.Now().Unix()
+					_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
+						profileAssetBotKey(target.UserID, targetBot), msg.Photo[len(msg.Photo)-1].FileID, now)
+				}
+				return resp, nil
+			} else if err != nil {
+				log.Printf("sendProfilePhoto copyMessage user=%s viewer=%s: %v", target.UserID, viewerID, err)
+			}
+		}
+	}
+
+	// 3) Default avatar (also refreshes nothing — nothing cached to refresh).
+	return s.send(ctx, "sendPhoto", buildPhotoParams(s.defaultProfilePhoto(target.Gender)))
+}
+
+// MigrateOldProfilePhotos is the one-time background migration (Step 3): every
+// user with users.image set but no shared-cache entry gets re-issued through
+// the Profile Topic so all bots share one valid copy. It is idempotent
+// (ON CONFLICT upserts + NOT EXISTS guard) and rate-limited to avoid FloodWait.
+func (s *Service) MigrateOldProfilePhotos(ctx context.Context) {
+	// Only the main bot migrates; every fleet member shares the same DB, so
+	// without this guard all 6 bots would re-upload every photo 6 times.
+	if s.cfg.BotID != "" && s.cfg.MainBotID != "" && s.cfg.BotID != s.cfg.MainBotID {
+		return
+	}
+	adminGroupID := s.adminGroupID(ctx)
+	if adminGroupID == "" {
+		log.Printf("migrateOldProfilePhotos: no admin group, skipping")
+		return
+	}
+	rows, err := s.store.DB().Query(ctx, `
+		SELECT u.user_id, u.uniq_id, u.image
+		FROM users u
+		LEFT JOIN telegram_assets a ON a.name = ('user:' || u.user_id)
+		WHERE u.image IS NOT NULL AND u.image <> '' AND a.name IS NULL
+		ORDER BY u.id
+		LIMIT 5000`)
+	if err != nil {
+		log.Printf("migrateOldProfilePhotos query: %v", err)
+		return
+	}
+	type pending struct{ userID, uniqID, image string }
+	var items []pending
+	for rows.Next() {
+		var p pending
+		if err := rows.Scan(&p.userID, &p.uniqID, &p.image); err != nil {
+			continue
+		}
+		items = append(items, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		log.Printf("migrateOldProfilePhotos rows: %v", err)
+		return
+	}
+	if len(items) == 0 {
+		return
+	}
+	log.Printf("migrateOldProfilePhotos: migrating %d photos", len(items))
+	migrated, failed := 0, 0
+	for _, p := range items {
+		select {
+		case <-ctx.Done():
+			log.Printf("migrateOldProfilePhotos: stopped early (%d/%d done)", migrated, len(items))
+			return
+		default:
+		}
+		resp, sendErr := s.send(ctx, "sendPhoto", map[string]any{
+			"chat_id":           adminGroupID,
+			"message_thread_id": adminTopicProfile,
+			"photo":             p.image,
+			"caption":           fmt.Sprintf("🖼 تصویر پروفایل (مهاجرت)\n\nuser_id: %s\nuniq_id: %s\nشناسه: /user_%s", p.userID, p.uniqID, p.uniqID),
+			"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+				{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", p.userID))},
+			})),
+		})
+		if sendErr != nil || !resp.Ok {
+			failed++
+			// The legacy users.image file_id may itself belong to a dead bot
+			// or an expired file — skip it; the user re-upload heals the cache.
+			continue
+		}
+		msg, ok := s.tg.SentMessage(resp)
+		if !ok || len(msg.Photo) == 0 {
+			failed++
+			continue
+		}
+		s.cacheProfilePhoto(ctx, p.userID, msg.Photo[len(msg.Photo)-1].FileID, msg.MessageID, time.Now().Unix())
+		migrated++
+		time.Sleep(250 * time.Millisecond)
+	}
+	log.Printf("migrateOldProfilePhotos: done migrated=%d failed=%d", migrated, failed)
 }
 
 func (s *Service) completeProfile(ctx context.Context, user storage.User) (count int, info string, inline [][]button) {

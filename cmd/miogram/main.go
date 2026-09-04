@@ -122,6 +122,10 @@ func main() {
 	if err := botService.WarmHelpAssets(ctx); err != nil {
 		log.Printf("warm help assets: %v", err)
 	}
+	// One-time background migration of legacy users.image photos into the
+	// shared Profile Topic cache (telegram_assets). Idempotent, rate-limited,
+	// and self-skipping on helper bots (only main migrates).
+	go botService.MigrateOldProfilePhotos(ctx)
 	payService := payments.New(cfg, store, tg)
 	botService.SetPayments(payService)
 	scheduler := jobs.New(cfg, store, tg, q, botService)
