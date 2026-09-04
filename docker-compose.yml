@@ -6,12 +6,18 @@ services:
       - "8080:8080"
     volumes:
       - ./ssl/cert.pem:/app/ssl/cert.pem:ro
+      - ./bot/profile-users:/app/bot/profile-users
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   app-shard1:
     build: .
@@ -20,12 +26,18 @@ services:
       - "8081:8081"
     volumes:
       - ./ssl/cert.pem:/app/ssl/cert.pem:ro
+      - ./bot/profile-users:/app/bot/profile-users
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   app-shard2:
     build: .
@@ -34,12 +46,18 @@ services:
       - "8082:8082"
     volumes:
       - ./ssl/cert.pem:/app/ssl/cert.pem:ro
+      - ./bot/profile-users:/app/bot/profile-users
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   app-shard3:
     build: .
@@ -48,12 +66,18 @@ services:
       - "8083:8083"
     volumes:
       - ./ssl/cert.pem:/app/ssl/cert.pem:ro
+      - ./bot/profile-users:/app/bot/profile-users
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   app-shard4:
     build: .
@@ -62,12 +86,18 @@ services:
       - "8084:8084"
     volumes:
       - ./ssl/cert.pem:/app/ssl/cert.pem:ro
+      - ./bot/profile-users:/app/bot/profile-users
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   app-shard5:
     build: .
@@ -76,12 +106,18 @@ services:
       - "8085:8085"
     volumes:
       - ./ssl/cert.pem:/app/ssl/cert.pem:ro
+      - ./bot/profile-users:/app/bot/profile-users
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   postgres:
     image: postgres:16-alpine
@@ -98,10 +134,15 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -110,6 +151,11 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   postgres_data:
