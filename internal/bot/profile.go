@@ -3,8 +3,8 @@ package bot
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/url"
+	"path/filepath"
 	"strings"
 
 	"miogram/internal/storage"
@@ -75,14 +75,29 @@ func (s *Service) showSelfProfile(ctx context.Context, c *UpdateContext) error {
 	_ = s.store.DB().QueryRow(ctx, `SELECT count(*) FROM likes WHERE target_id=$1`, c.UserID).Scan(&count)
 	caption := fmt.Sprintf("• نام: %s\n• جنسیت: %s\n• استان: %s\n• شهر: %s\n• سن: %d\n\n♥️ لایک ها : %d\n\n%s\n\n‏🆔 آیدی : /user_%s\n‏",
 		checkInout(c.User.Name), GenderWithEmoji[c.User.Gender], c.User.State, checkInout(c.User.City), c.User.Age, count, lastActivity(c.Now, c.User.LastActivity), c.User.UniqID)
-	// Routing-aware shared-cache delivery: per-bot file_id, else copyMessage
-	// from the Profile Topic, else gender default. Never uses users.image.
-	_, err := s.sendProfilePhoto(ctx, c.UserID, c.User, caption, telegram.JSON(replyMarkupInline([][]button{
-		{callbackButton("📍مشاهده موقعیت GPS ثبت شده من", "profile;gps_show")},
-		{callbackButton("🙍‍♂️🙎‍♀️ مخاطبین", "contacts;none"), callbackButton("❤️ لایک های من", "likes;none")},
-		{callbackButton("🚫 بلاک شده ها", "blockeds;none"), callbackButton("🔕 سایلنت", "profile;silent;none")},
-		{callbackButton("📝 ویرایش اطلاعات پروفایل", "profile;edit")},
-	})), c.MessageID)
+	resp, err := s.send(ctx, "sendPhoto", map[string]any{
+		"chat_id":             c.UserID,
+		"photo":               s.userProfilePhoto(ctx, c.User),
+		"caption":             caption,
+		"reply_to_message_id": c.MessageID,
+		"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+			{callbackButton("📍مشاهده موقعیت GPS ثبت شده من", "profile;gps_show")},
+			{callbackButton("🙍‍♂️🙎‍♀️ مخاطبین", "contacts;none"), callbackButton("❤️ لایک های من", "likes;none")},
+			{callbackButton("🚫 بلاک شده ها", "blockeds;none"), callbackButton("🔕 سایلنت", "profile;silent;none")},
+			{callbackButton("📝 ویرایش اطلاعات پروفایل", "profile;edit")},
+		})),
+	})
+	if err != nil {
+		return err
+	}
+	if !resp.Ok && c.User.Image != "" {
+		_, _ = s.send(ctx, "sendPhoto", map[string]any{
+			"chat_id":             c.UserID,
+			"photo":               s.defaultProfilePhoto(c.User.Gender),
+			"caption":             caption,
+			"reply_to_message_id": c.MessageID,
+		})
+	}
 	countMissing, info, inline := s.completeProfile(ctx, c.User)
 	if countMissing > 0 {
 		_, err = s.send(ctx, "sendMessage", map[string]any{
@@ -112,14 +127,24 @@ func (s *Service) showUserProfile(ctx context.Context, c *UpdateContext, user st
 	if !user.IsFake {
 		_ = s.store.DB().QueryRow(ctx, `SELECT count(*) FROM likes WHERE target_id=$1`, user.UserID).Scan(&likes)
 	}
-	caption := fmt.Sprintf("• نام: %s\n• جنسیت: %s\n• استان: %s\n• شهر: %s\n• سن: %d\n\n♥️ لایک ها: %d\n\n%s%s\n\n‏🆔 آیدی : /user_%s\n\n\n🏁 فاصله از شما: %s",
-		checkInout(user.Name), GenderWithEmoji[user.Gender], user.State, checkInout(user.City), user.Age, likes, lastActivity(c.Now, user.LastActivity), statusChat, user.UniqID, d)
-	replyToID := 0
-	if replyTo {
-		replyToID = c.MessageID
+	params := map[string]any{
+		"chat_id": c.UserID,
+		"photo":   s.userProfilePhoto(ctx, user),
+		"caption": fmt.Sprintf("• نام: %s\n• جنسیت: %s\n• استان: %s\n• شهر: %s\n• سن: %d\n\n♥️ لایک ها: %d\n\n%s%s\n\n‏🆔 آیدی : /user_%s\n\n\n🏁 فاصله از شما: %s",
+			checkInout(user.Name), GenderWithEmoji[user.Gender], user.State, checkInout(user.City), user.Age, likes, lastActivity(c.Now, user.LastActivity), statusChat, user.UniqID, d),
+		"reply_markup": telegram.JSON(replyMarkupInline(s.generateInlineButtons(ctx, c, user))),
 	}
-	// Shared-cache delivery (same fallback chain as showSelfProfile).
-	resp, err := s.sendProfilePhoto(ctx, c.UserID, user, caption, telegram.JSON(replyMarkupInline(s.generateInlineButtons(ctx, c, user))), replyToID)
+	if replyTo {
+		params["reply_to_message_id"] = c.MessageID
+	}
+	resp, err := s.send(ctx, "sendPhoto", params)
+	if err != nil {
+		return err
+	}
+	if !resp.Ok && user.Image != "" {
+		params["photo"] = s.defaultProfilePhoto(user.Gender)
+		resp, err = s.send(ctx, "sendPhoto", params)
+	}
 	if err == nil && resp.Ok {
 		s.notifyProfileView(ctx, c, user)
 	}
@@ -475,9 +500,8 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			_, err = s.checkProfileCoin(ctx, c)
 		}
 		return true, err
-
-
 	case "set_image":
+		completingProfile := c.User.PrevStep == "complete_profile"
 		fileID := photoID(c.Message)
 		if fileID == "" {
 			_, err := s.send(ctx, "sendMessage", map[string]any{
@@ -491,54 +515,101 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			return true, err
 		}
 
-		// ۱. ذخیره فایل‌آیدی خام در users.image (فقط مرجع/لاگ — هرگز مستقیم ارسال نشود)
-		_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
+		// Download photo to server as binary
+		profileDir := filepath.Join("bot", "profile-users")
+		profilePath := filepath.Join(profileDir, fmt.Sprintf("user_%s.jpg", c.UserID))
+		if err := s.tg.DownloadFile(ctx, fileID, profilePath); err != nil {
+			_, _ = s.send(ctx, "sendMessage", map[string]any{
+				"chat_id":             c.UserID,
+				"text":                "⚠️ خطا: در دانلود عکس مشکلی پیش آمد. لطفاً دوباره تلاش کنید.",
+				"reply_to_message_id": c.MessageID,
+			})
+			return true, fmt.Errorf("download profile photo: %w", err)
+		}
+
+		_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='superseded' WHERE user_id=$1 AND status='pending'`, c.UserID)
+		var reviewID int64
+		err := s.store.DB().QueryRow(ctx, `INSERT INTO profile_reviews (user_id,file_id,status,created_at) VALUES ($1,$2,'pending',$3) RETURNING id`, c.UserID, fileID, c.Now).Scan(&reviewID)
 		if err != nil {
 			return true, err
 		}
 
-		// ۲. صدور مجدد از طریق Profile Topic: فایل‌آیدیِ پیامِ برگشتی متعلق
-		// به همین بات است و در کش مشترک ذخیره می‌شود. users.image عمداً
-		// به‌روزرسانی نمی‌شود (فقط مرجع می‌ماند).
+		// Send to admin group topic using LocalFile
 		adminGroupID := s.adminGroupID(ctx)
+		var resp telegram.APIResponse
+		var sendErr error
 		if adminGroupID != "" {
-			resp, sendErr := s.send(ctx, "sendPhoto", map[string]any{
+			resp, sendErr = s.send(ctx, "sendPhoto", map[string]any{
 				"chat_id":           adminGroupID,
 				"message_thread_id": adminTopicProfile,
-				"photo":             fileID,
-				"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nuser_id: %s\nuniq_id: %s\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
-					c.UserID, c.User.UniqID, c.UserID, c.UserID, c.User.UniqID),
-				"parse_mode": "HTML",
-				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-					{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", c.UserID))},
-				})),
+				"photo":             telegram.LocalFile{Path: profilePath},
+				"caption":           fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", c.UserID, c.UserID, c.User.UniqID),
+				"parse_mode":        "HTML",
+				"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
+					callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
+					callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
+				}})),
 			})
-			if sendErr != nil {
-				log.Printf("profile set_image: admin topic send user=%s: %v", c.UserID, sendErr)
-			} else if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
-				s.cacheProfilePhoto(ctx, c.UserID, msg.Photo[len(msg.Photo)-1].FileID, msg.MessageID, c.Now)
+		}
+		if adminGroupID == "" || sendErr != nil || !resp.Ok {
+			// Fallback to support group or admin
+			fallbackChatID := c.Admin.Support
+			if fallbackChatID == "" {
+				fallbackChatID = s.cfg.AdminID
+			}
+			fallbackParams := map[string]any{
+				"chat_id":    fallbackChatID,
+				"photo":      telegram.LocalFile{Path: profilePath},
+				"caption":    fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", c.UserID, c.UserID, c.User.UniqID),
+				"parse_mode": "HTML",
+				"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
+					callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
+					callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
+				}})),
+			}
+			if fallbackChatID == c.Admin.AdminGroupID {
+				fallbackParams["message_thread_id"] = adminTopicProfile
+			}
+			resp, sendErr = s.send(ctx, "sendPhoto", fallbackParams)
+			if sendErr != nil || !resp.Ok {
+				_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='send_failed' WHERE id=$1`, reviewID)
+				if sendErr != nil {
+					return true, fmt.Errorf("send profile review: %w", sendErr)
+				}
+				return true, fmt.Errorf("send profile review failed")
 			}
 		}
+		if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
+			cachedID := msg.Photo[len(msg.Photo)-1].FileID
+			_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET file_id=$2,message_id_admin=$3 WHERE id=$1`, reviewID, cachedID, msg.MessageID)
+		}
 
-		// ۳. به‌روزرسانی مرحله کاربر
+		// Store the image file_id and profile_path in users table
+		_, _ = s.store.DB().Exec(ctx, `UPDATE users SET image=$2,profile_path=$3 WHERE user_id=$1`, c.UserID, fileID, profilePath)
+
 		_ = s.store.UpdateUserStepPrev(ctx, c.UserID, "start", "start")
 		c.User.Step = "start"
 		c.User.PrevStep = "start"
 		c.refreshStep()
+
+		// Reload user to update Image and ProfilePath fields
 		_ = s.reloadUser(ctx, c)
 
-		// ۴. پیام موفقیت به کاربر (بدون اشاره به تأیید ادمین)
 		_, err = s.send(ctx, "sendMessage", map[string]any{
 			"chat_id":      c.UserID,
-			"text":         "✅ تصویر شما با موفقیت ثبت شد.",
+			"text":         "✅ عکس شما دریافت شد و پس از تأیید مدیریت در پروفایل نمایش داده می‌شود.\n\n💡 پروفایل شما تکمیل شد و ۵ سکه جایزه دریافت کردید!",
 			"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
 		})
-		if err != nil {
-			return true, err
+
+		// Check and award profile completion coin
+		if err == nil {
+			_, err = s.checkProfileCoin(ctx, c)
 		}
 
-		// ۵. اهدای سکه در صورت تکمیل پروفایل
-		_, err = s.checkProfileCoin(ctx, c)
+		// If profile was being completed and location is missing, ask for GPS
+		if err == nil && completingProfile && c.User.Latitude == 0 {
+			err = s.askProfileGPS(ctx, c)
+		}
 		return true, err
 	}
 	return false, nil

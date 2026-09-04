@@ -90,25 +90,26 @@ func (s *Service) Process(ctx context.Context, up telegram.Update, botID string)
 		return err
 	}
 
-	// PEAK interception for registered users: when the main bot is in peak
-	// mode and the user is already registered (gender, age, state all set),
-	// send ONLY the migration message. The original message is IGNORED.
-	if s.fleet != nil && s.fleet.Mode() == fleet.ModePeak && s.cfg.BotID == s.cfg.MainBotID {
-		if c.User.UserID != "" && c.User.Gender != "" && c.User.Age > 0 && c.User.State != "" {
-			return s.sendMigrationToHelper(ctx, &c)
-		}
-	}
-
 	handled, stop, err := s.handleAuth(ctx, &c)
 	if err != nil || stop || handled {
 		return err
 	}
 
-	// Capacity-driven redirect: when the main bot queue is full during peak
-	// mode, send a single direct migration link via consistent hashing.
-	// Never show a list of helpers — always ONE link to ONE helper.
+	// Classroom-selection guard + capacity-driven redirect (new flow).
+	// While a user is choosing a shard, only the deep link (handled in
+	// handleAuth) and the "stay_classroom" callback (handled in handleStatic)
+	// are honoured; every other input is ignored so the choice screen stays
+	// clean.
+	if c.User.Step == "choose_classroom" && c.BotID == s.cfg.MainBotID {
+		if c.Message != nil && c.Message.Text != "" {
+			return nil
+		}
+		if c.Callback != nil && c.Data != "stay_classroom" {
+			return s.answer(ctx, &c, "لطفاً یکی از کلاس‌ها را انتخاب کنید یا روی «می‌خواهم در کلاس اصلی بمانم» کلیک کنید.")
+		}
+	}
 	if s.shouldRedirectToClassroom(ctx, &c) {
-		return s.sendMigrationToHelper(ctx, &c)
+		return s.presentClassroomChoice(ctx, &c)
 	}
 
 	if c.User.UserID == "" {
@@ -215,10 +216,12 @@ func (s *Service) afterUserOnline(ctx context.Context, c *UpdateContext) error {
 	return nil
 }
 
-// shouldRedirectToClassroom reports whether a user on the main bot should be
-// offered a migration link because the main bot is at capacity during peak
-// mode. Sends a single direct link via consistent hashing — never a list.
-// Chatting users are always protected and never prompted.
+// shouldRedirectToClassroom reports whether an idle (non-chatting) user on the
+// main bot should be offered the classroom-selection screen because the main
+// bot is at capacity. Chatting users are always protected and never prompted.
+// Once a user is already in the choose_classroom state we must not re-present
+// the screen on every subsequent message (the guard in Process suppresses all
+// other input while choosing).
 func (s *Service) shouldRedirectToClassroom(ctx context.Context, c *UpdateContext) bool {
 	if s.cfg.BotID != s.cfg.MainBotID {
 		return false
@@ -226,10 +229,10 @@ func (s *Service) shouldRedirectToClassroom(ctx context.Context, c *UpdateContex
 	if s.fleet == nil || s.redis == nil {
 		return false
 	}
-	if s.fleet.Mode() == fleet.ModeOffPeak {
+	if strings.HasPrefix(c.User.Step, "chatting;") {
 		return false
 	}
-	if strings.HasPrefix(c.User.Step, "chatting;") {
+	if c.User.Step == "choose_classroom" {
 		return false
 	}
 	queueLen, err := s.redis.OutboundQueueLen(ctx, s.cfg.MainBotID)
@@ -239,10 +242,44 @@ func (s *Service) shouldRedirectToClassroom(ctx context.Context, c *UpdateContex
 	return queueLen >= int64(s.cfg.PeakQueueLen) || s.fleet.Flooded()
 }
 
-// handleClassroomChoice is invoked by the /start classroom_<id> deep link.
-// The link embeds the user's Telegram ID (stable across every bot instance)
-// so it verifies correctly on the target shard — unlike UniqID, which differs
-// per bot.
+// presentClassroomChoice shows the user a menu of shard deep links plus a
+// "stay on main" option. The user picks where to go; nothing else is acted on
+// while they are in the choose_classroom state.
+func (s *Service) presentClassroomChoice(ctx context.Context, c *UpdateContext) error {
+	if err := s.store.UpdateUserStep(ctx, c.UserID, "choose_classroom"); err != nil {
+		return err
+	}
+	var buttons [][]button
+	for _, helperID := range s.getHelperIDs() {
+		username := s.fleet.HelperUsername(helperID)
+		if username == "" {
+			continue
+		}
+		link := "https://t.me/" + strings.TrimPrefix(username, "@") + "?start=classroom_" + c.UserID
+		buttons = append(buttons, []button{urlButton(
+			fmt.Sprintf("📚 کلاس %s", helperID),
+			link,
+		)})
+	}
+	buttons = append(buttons, []button{callbackButton("⏳ می‌خواهم در کلاس اصلی بمانم", "stay_classroom")})
+	_, err := s.send(ctx, "sendMessage", map[string]any{
+		"chat_id": c.UserID,
+		"text": "⚠️ **کلاس اصلی پر شده است!**\n\n" +
+			"سلام کاربر عزیز،\n\n" +
+			"کلاس اصلی ربات (کلاس ۱) به ظرفیت کامل رسیده است. برای ادامه استفاده از ربات، لطفاً یکی از کلاس‌های زیر را انتخاب کنید:\n\n" +
+			"📌 هر کلاس کاملاً مشابه کلاس اصلی است و تمام امکانات را دارد.\n\n" +
+			"⏳ اگر ترجیح می‌دهید در کلاس اصلی بمانید، روی گزینه «می‌خواهم در کلاس اصلی بمانم» کلیک کنید و منتظر بمانید تا ظرفیت آزاد شود.\n\n" +
+			"با تشکر از صبر و همراهی شما!",
+		"parse_mode":   "Markdown",
+		"reply_markup": telegram.JSON(replyMarkupInline(buttons)),
+	})
+	return err
+}
+
+// handleClassroomChoice is invoked by the /start classroom_<id> deep link that
+// the user clicks from presentClassroomChoice. The link embeds the user's
+// Telegram ID (stable across every bot instance) so it verifies correctly on
+// the target shard — unlike UniqID, which differs per bot.
 func (s *Service) handleClassroomChoice(ctx context.Context, c *UpdateContext) error {
 	payload := strings.TrimPrefix(c.Text, "/start classroom_")
 	if payload == "" {
@@ -280,7 +317,29 @@ func (s *Service) handleClassroomChoice(ctx context.Context, c *UpdateContext) e
 	_ = s.store.UpdateUserStep(ctx, c.UserID, "start")
 	_, err := s.send(ctx, "sendMessage", map[string]any{
 		"chat_id":      c.UserID,
-		"text":         "✅ شما با موفقیت به ربات کمکی منتقل شدید! اکنون می‌توانید از تمام امکانات ربات استفاده کنید.",
+		"text":         fmt.Sprintf("✅ شما با موفقیت به کلاس %s منتقل شدید! اکنون می‌توانید از تمام امکانات ربات استفاده کنید.", targetBotID),
+		"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
+	})
+	return err
+}
+
+// handleStayClassroom lets a user opt to remain on the main bot despite the
+// capacity prompt, registering a cooldown so they are not re-prompted.
+func (s *Service) handleStayClassroom(ctx context.Context, c *UpdateContext) error {
+	if s.redis != nil {
+		ok, err := s.redis.Client().SetNX(ctx, "fleet:stayclassroom:"+c.UserID, 1, 15*time.Minute).Result()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return s.answer(ctx, c, "شما قبلاً درخواست ماندن در کلاس اصلی را داده‌اید. لطفاً ۱۵ دقیقه صبر کنید.")
+		}
+	}
+	_ = s.store.UpdateUserStep(ctx, c.UserID, "start")
+	s.deleteMessage(ctx, c.UserID, c.MessageID)
+	_, err := s.send(ctx, "sendMessage", map[string]any{
+		"chat_id":      c.UserID,
+		"text":         "✅ درخواست شما ثبت شد. به محض آزاد شدن ظرفیت در کلاس اصلی، به شما اطلاع داده می‌شود.",
 		"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
 	})
 	return err
@@ -302,20 +361,9 @@ func (s *Service) getHelperIDs() []string {
 // Active-chat protection: a user mid-conversation is NOT bounced — their chat
 // continues on this helper until it ends ("never force-move a chatting user").
 // The very next update after end-chat triggers the bounce.
-//
-// Routing-aware: if the user's routing already points to this helper, the
-// bounce is skipped even if they are not chatting — they belong here.
 func (s *Service) bounceToMain(ctx context.Context, c *UpdateContext) error {
 	if s.userIsChatting(ctx, c.UserID) {
 		return nil
-	}
-	// If the user's routing is already set to this helper, they belong here
-	// — no bounce needed. This prevents bouncing chatting users whose routing
-	// wasn't updated after migration.
-	if s.redis != nil && c.UserID != "" {
-		if routed, err := s.redis.GetUserBot(ctx, c.UserID); err == nil && routed == c.BotID {
-			return nil
-		}
 	}
 	if s.redis != nil && c.UserID != "" {
 		if _, err := s.redis.MoveUserBot(ctx, c.UserID, s.cfg.MainBotID); err != nil {
@@ -516,31 +564,7 @@ func (s *Service) notifyMovedBack(ctx context.Context, userID string) {
 			"✅ ربات قبلی موقتاً غیرفعال بود؛ گفتگوی شما به ربات اصلی منتقل شد.\n" +
 			"https://t.me/" + mainUsername,
 		"disable_web_page_preview": true,
-	}, s.cfg.OutboundShardCount)
-}
-
-// sendMigrationToHelper sends the PEAK-mode migration message to the user.
-// The original message that triggered this is IGNORED.
-// The link uses classroom_ method and consistent-hash helper selection.
-func (s *Service) sendMigrationToHelper(ctx context.Context, c *UpdateContext) error {
-	if s.fleet == nil || len(s.cfg.Helpers) == 0 {
-		return nil
-	}
-	helper := s.fleet.AssignHelper(c.UserID)
-	username := s.fleet.HelperUsername(helper)
-	if username == "" {
-		return nil
-	}
-	link := "https://t.me/" + strings.TrimPrefix(username, "@") + "?start=classroom_" + c.UserID
-	_, err := s.send(ctx, "sendMessage", map[string]any{
-		"chat_id": c.UserID,
-		"text": "🤖 پیام سیستم 👇\n\n" +
-			"⚠️ ربات اصلی در ساعات پرترافیک قرار دارد. برای ادامه بدون وقفه و دریافت پیام‌ها از ربات کمکی استفاده کنید 👇",
-		"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-			{urlButton("🚀 انتقال به ربات کمکی", link)},
-		})),
 	})
-	return err
 }
 
 // fromUserParam is an internal marker threaded through send() params so the
@@ -622,8 +646,7 @@ func isSendMethod(method string) bool {
 }
 
 // suggestMigrationIfNeeded proactively offers the consistent-hash helper
-// during peak hours once per cooldown window per user. In OFFPEAK mode this
-// is a no-op: main handles all users unconditionally.
+// during peak hours once per cooldown window per user.
 func (s *Service) suggestMigrationIfNeeded(ctx context.Context, c *UpdateContext) {
 	if s.fleet == nil || s.redis == nil || s.cfg.IsHelper() {
 		// Only the main bot suggests moving to helpers.
@@ -684,7 +707,7 @@ func (s *Service) StartLoadMonitoring(ctx context.Context, q *queue.Queue) {
 			if q == nil {
 				continue
 			}
-			queueLen, err := q.OutboundQueueLen(ctx, s.cfg.BotID)
+			queueLen, err := q.Client().LLen(ctx, "outbound:"+s.cfg.BotID).Result()
 			if err != nil {
 				log.Printf("load monitor: %v", err)
 				continue
@@ -699,11 +722,7 @@ func (s *Service) StartLoadMonitoring(ctx context.Context, q *queue.Queue) {
 }
 
 // maybeRedirectNewUser assigns brand-new users to their consistent-hash helper
-// whenever the main bot is under pressure (active flood limiting only).
-//
-// In PEAK mode, new users are NOT redirected — they must complete registration
-// first. After registration, the PEAK interception in Process() sends the
-// migration message.
+// whenever the main bot is under pressure (peak mode or active flood limiting).
 func (s *Service) maybeRedirectNewUser(ctx context.Context, c *UpdateContext) (bool, error) {
 	// فقط برای کاربران جدید (هنوز در دیتابیس ثبت نشده‌اند)
 	if c.User.UserID != "" || s.fleet == nil || s.redis == nil || s.cfg.IsHelper() {
@@ -712,13 +731,7 @@ func (s *Service) maybeRedirectNewUser(ctx context.Context, c *UpdateContext) (b
 	if len(s.cfg.Helpers) == 0 {
 		return false, nil
 	}
-	// In PEAK mode, new users must complete registration first. The migration
-	// message is sent after registration completes (see Process()).
-	if s.fleet.Mode() == fleet.ModePeak {
-		return false, nil
-	}
-	// Only redirect during active flood limiting (not general peak mode).
-	if !s.fleet.Flooded() {
+	if s.fleet.Mode() != fleet.ModePeak && !s.fleet.Flooded() {
 		return false, nil
 	}
 	targetBot := s.fleet.AssignHelper(c.UserID)
@@ -727,7 +740,7 @@ func (s *Service) maybeRedirectNewUser(ctx context.Context, c *UpdateContext) (b
 		return false, nil
 	}
 
-	link := "https://t.me/" + targetUsername + "?start=classroom_" + c.UserID
+	link := "https://t.me/" + targetUsername + "?start=migrate"
 	_, err := s.send(ctx, "sendMessage", map[string]any{
 		"chat_id": c.UserID,
 		"text":    "⚠️ ربات اصلی موقتاً شلوغ است. برای ادامه از ربات زیر استفاده کنید 👇",
@@ -936,258 +949,19 @@ func (s *Service) defaultProfilePhoto(gender string) any {
 }
 
 func (s *Service) userProfilePhoto(ctx context.Context, user storage.User) any {
-	// Shared cache only: file_ids in users.image are bot-specific and must
-	// never be used directly (they cause "wrong file identifier" on other
-	// bots). The canonical entry user:<id> holds a file_id re-issued via
-	// the Profile Topic, which every fleet member can resolve through
-	// sendProfilePhoto (per-bot entry or copyMessage fallback).
-	var fileID string
-	if user.UserID != "" {
-		_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetKey(user.UserID)).Scan(&fileID)
-	}
-	if fileID == "" {
-		return s.defaultProfilePhoto(user.Gender)
-	}
-	return fileID
-}
-
-// profileAssetKey is the canonical shared-cache key for a user's profile
-// photo (Step 1.4 / Step 2.1 of the shared-cache design).
-func profileAssetKey(userID string) string {
-	return "user:" + userID
-}
-
-// profileAssetMsgKey stores the Profile Topic message_id for a user's photo.
-// copyMessage(from_chat_id=adminGroup, message_id) works from ANY bot in the
-// group, so it is the truly cross-bot fallback when a cached file_id belongs
-// to a different bot token.
-func profileAssetMsgKey(userID string) string {
-	return "user:" + userID + ":msg"
-}
-
-// profileAssetBotKey stores the per-bot usable file_id for a user's photo.
-// Telegram file_ids are bot-specific: a file_id issued to shard3 cannot be
-// sent by main. Each bot lazily populates its own entry after a successful
-// sendPhoto/copyMessage, so the hot path never hits "wrong file identifier".
-func profileAssetBotKey(userID, botID string) string {
-	return "user:" + userID + ":" + botID
-}
-
-// cacheProfilePhoto stores a Profile Topic re-issue in telegram_assets:
-//   - user:<id>         canonical file_id (spec compliance / observability)
-//   - user:<id>:<botID> per-bot usable file_id for the issuing bot
-//   - user:<id>:msg     Profile Topic message_id for cross-bot copyMessage
-func (s *Service) cacheProfilePhoto(ctx context.Context, userID, fileID string, messageID int, now int64) {
-	if userID == "" || (fileID == "" && messageID == 0) {
-		return
-	}
-	if now == 0 {
-		now = time.Now().Unix()
-	}
-	if fileID != "" {
-		_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
-			profileAssetKey(userID), fileID, now)
-		if s.cfg.BotID != "" {
-			_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
-				profileAssetBotKey(userID, s.cfg.BotID), fileID, now)
-		}
-	}
-	if messageID != 0 {
-		_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
-			profileAssetMsgKey(userID), strconv.Itoa(messageID), now)
-	}
-}
-
-// profilePhotoForBot returns the file_id usable by botID for this user, or "".
-// It prefers the per-bot entry and falls back to the canonical entry (which
-// is only valid if it was issued to botID).
-func (s *Service) profilePhotoForBot(ctx context.Context, userID, botID string) string {
-	if userID == "" {
-		return ""
-	}
-	var fileID string
-	if botID != "" {
-		if err := s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetBotKey(userID, botID)).Scan(&fileID); err == nil && fileID != "" {
-			return fileID
-		}
-	}
-	// Canonical fallback (spec Step 2.2). May still be a foreign bot's
-	// file_id — callers must handle "wrong file identifier" via copyMessage.
-	_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetKey(userID)).Scan(&fileID)
-	return fileID
-}
-
-// sendProfilePhoto delivers a user's profile photo to viewerID, hiding the
-// bot-specific file_id problem:
-//
-//  1. Resolve the bot that will actually execute the send (viewer's routing).
-//  2. Try that bot's per-bot cached file_id via sendPhoto.
-//  3. On miss / "wrong file identifier", copyMessage the Profile Topic
-//     message (works from any bot in the group) and cache the resulting
-//     per-bot file_id for next time.
-//  4. Fall back to the gender default photo.
-//
-// It returns the underlying telegram response (or the default-photo response).
-func (s *Service) sendProfilePhoto(ctx context.Context, viewerID string, target storage.User, caption string, replyMarkup string, replyTo int) (telegram.APIResponse, error) {
-	buildPhotoParams := func(photo any) map[string]any {
-		p := map[string]any{"chat_id": viewerID, "photo": photo, "caption": caption}
-		if replyMarkup != "" {
-			p["reply_markup"] = replyMarkup
-		}
-		if replyTo != 0 {
-			p["reply_to_message_id"] = replyTo
-		}
-		return p
-	}
-
-	// The bot that will execute the API call (routing-aware).
-	targetBot := s.cfg.BotID
-	if viewerID != "" {
-		if resolved, rerr := s.resolveDelivery(ctx, viewerID); rerr == nil && resolved != "" {
-			targetBot = resolved
-		}
-	}
-
-	isWrongFileID := func(resp telegram.APIResponse, err error) bool {
-		if err != nil && strings.Contains(strings.ToLower(err.Error()), "file identifier") {
-			return true
-		}
-		if !resp.Ok && strings.Contains(strings.ToLower(resp.Description), "file identifier") {
-			return true
-		}
-		return false
-	}
-
-	// 1) Per-bot (or canonical) file_id fast path.
-	if fileID := s.profilePhotoForBot(ctx, target.UserID, targetBot); fileID != "" {
-		resp, err := s.send(ctx, "sendPhoto", buildPhotoParams(fileID))
-		if err == nil && resp.Ok {
-			return resp, nil
-		}
-		if !isWrongFileID(resp, err) && (err != nil || !resp.Ok) {
-			// A non-file_id failure (blocked bot, network, ...): surface it
-			// unless it is a deliverability case the caller handles.
-			if err != nil {
-				log.Printf("sendProfilePhoto sendPhoto user=%s viewer=%s bot=%s: %v", target.UserID, viewerID, targetBot, err)
-			}
-		}
-		// Wrong-file-id or empty: fall through to copyMessage. Drop a stale
-		// per-bot entry so the next attempt re-caches.
-		if targetBot != "" {
-			_, _ = s.store.DB().Exec(ctx, `DELETE FROM telegram_assets WHERE name=$1`, profileAssetBotKey(target.UserID, targetBot))
-		}
-	}
-
-	// 2) Cross-bot fallback: copy the Profile Topic message. Any fleet
-	// member in the admin group can copy it, regardless of which bot
-	// originally uploaded the photo.
-	var msgIDStr string
-	_ = s.store.DB().QueryRow(ctx, `SELECT file_id FROM telegram_assets WHERE name=$1`, profileAssetMsgKey(target.UserID)).Scan(&msgIDStr)
-	if msgID, convErr := strconv.Atoi(strings.TrimSpace(msgIDStr)); convErr == nil && msgID != 0 {
-		if adminGroupID := s.adminGroupID(ctx); adminGroupID != "" {
-			cp := map[string]any{"chat_id": viewerID, "from_chat_id": adminGroupID, "message_id": msgID, "caption": caption}
-			if replyMarkup != "" {
-				cp["reply_markup"] = replyMarkup
-			}
-			if replyTo != 0 {
-				cp["reply_to_message_id"] = replyTo
-			}
-			if resp, err := s.send(ctx, "copyMessage", cp); err == nil && resp.Ok {
-				// copyMessage returns the new message; harvest this bot's
-				// own file_id for the hot path next time.
-				if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
-					now := time.Now().Unix()
-					_, _ = s.store.DB().Exec(ctx, `INSERT INTO telegram_assets (name,file_id,updated_at) VALUES ($1,$2,$3) ON CONFLICT (name) DO UPDATE SET file_id=excluded.file_id,updated_at=excluded.updated_at`,
-						profileAssetBotKey(target.UserID, targetBot), msg.Photo[len(msg.Photo)-1].FileID, now)
-				}
-				return resp, nil
-			} else if err != nil {
-				log.Printf("sendProfilePhoto copyMessage user=%s viewer=%s: %v", target.UserID, viewerID, err)
-			}
-		}
-	}
-
-	// 3) Default avatar (also refreshes nothing — nothing cached to refresh).
-	return s.send(ctx, "sendPhoto", buildPhotoParams(s.defaultProfilePhoto(target.Gender)))
-}
-
-// MigrateOldProfilePhotos is the one-time background migration (Step 3): every
-// user with users.image set but no shared-cache entry gets re-issued through
-// the Profile Topic so all bots share one valid copy. It is idempotent
-// (ON CONFLICT upserts + NOT EXISTS guard) and rate-limited to avoid FloodWait.
-func (s *Service) MigrateOldProfilePhotos(ctx context.Context) {
-	// Only the main bot migrates; every fleet member shares the same DB, so
-	// without this guard all 6 bots would re-upload every photo 6 times.
-	if s.cfg.BotID != "" && s.cfg.MainBotID != "" && s.cfg.BotID != s.cfg.MainBotID {
-		return
-	}
-	adminGroupID := s.adminGroupID(ctx)
-	if adminGroupID == "" {
-		log.Printf("migrateOldProfilePhotos: no admin group, skipping")
-		return
-	}
-	rows, err := s.store.DB().Query(ctx, `
-		SELECT u.user_id, u.uniq_id, u.image
-		FROM users u
-		LEFT JOIN telegram_assets a ON a.name = ('user:' || u.user_id)
-		WHERE u.image IS NOT NULL AND u.image <> '' AND a.name IS NULL
-		ORDER BY u.id
-		LIMIT 5000`)
-	if err != nil {
-		log.Printf("migrateOldProfilePhotos query: %v", err)
-		return
-	}
-	type pending struct{ userID, uniqID, image string }
-	var items []pending
-	for rows.Next() {
-		var p pending
-		if err := rows.Scan(&p.userID, &p.uniqID, &p.image); err != nil {
-			continue
-		}
-		items = append(items, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		log.Printf("migrateOldProfilePhotos rows: %v", err)
-		return
-	}
-	if len(items) == 0 {
-		return
-	}
-	log.Printf("migrateOldProfilePhotos: migrating %d photos", len(items))
-	migrated, failed := 0, 0
-	for _, p := range items {
-		select {
-		case <-ctx.Done():
-			log.Printf("migrateOldProfilePhotos: stopped early (%d/%d done)", migrated, len(items))
-			return
-		default:
-		}
-		resp, sendErr := s.send(ctx, "sendPhoto", map[string]any{
-			"chat_id":           adminGroupID,
-			"message_thread_id": adminTopicProfile,
-			"photo":             p.image,
-			"caption":           fmt.Sprintf("🖼 تصویر پروفایل (مهاجرت)\n\nuser_id: %s\nuniq_id: %s\nشناسه: /user_%s", p.userID, p.uniqID, p.uniqID),
-			"reply_markup": telegram.JSON(replyMarkupInline([][]button{
-				{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", p.userID))},
-			})),
-		})
-		if sendErr != nil || !resp.Ok {
-			failed++
-			// The legacy users.image file_id may itself belong to a dead bot
-			// or an expired file — skip it; the user re-upload heals the cache.
-			continue
-		}
-		msg, ok := s.tg.SentMessage(resp)
-		if !ok || len(msg.Photo) == 0 {
-			failed++
-			continue
-		}
-		s.cacheProfilePhoto(ctx, p.userID, msg.Photo[len(msg.Photo)-1].FileID, msg.MessageID, time.Now().Unix())
-		migrated++
-		time.Sleep(250 * time.Millisecond)
-	}
-	log.Printf("migrateOldProfilePhotos: done migrated=%d failed=%d", migrated, failed)
+    if user.Image == "" {
+        return s.defaultProfilePhoto(user.Gender)
+    }
+    var status string
+    err := s.store.DB().QueryRow(ctx, `
+        SELECT status FROM profile_reviews 
+        WHERE user_id=$1 AND status='approved' 
+        ORDER BY id DESC LIMIT 1
+    `, user.UserID).Scan(&status)
+    if err == nil && status == "approved" && user.ProfilePath != "" {
+        return telegram.LocalFile{Path: user.ProfilePath}
+    }
+    return s.defaultProfilePhoto(user.Gender)
 }
 
 func (s *Service) completeProfile(ctx context.Context, user storage.User) (count int, info string, inline [][]button) {

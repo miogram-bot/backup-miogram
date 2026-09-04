@@ -528,6 +528,7 @@ func scanUser(row pgx.Row) (User, error) {
 		&u.LastActivity, &u.LastCheckJoinAt, &u.IsCoinComplete, &u.IsLikes, &u.SameAge,
 		&u.Status, &u.Step, &u.PrevStep, &u.CreatedAt, &u.UniqID, &u.Distance, &u.Username,
 		&u.IsFake, &u.FakeLikes, &u.FakeSourceID, &u.ADSReferral, &u.ADSRegistrationStarted,
+		&u.ProfilePath,
 	)
 	return u, err
 }
@@ -538,7 +539,8 @@ const UserColumns = `
 	latitude, longitude, coalesce(image,''), num_chats, coalesce(referral,''), silent,
 	last_activity, last_check_join_at, is_coin_comprof::bool, is_likes::bool, same_age::bool,
 	status, step, prev_step, created_at, coalesce(uniq_id,''), 0::float8 AS distance, coalesce(username,''),
-	is_fake, fake_likes, fake_source_id, ads_referral, ads_registration_started`
+	is_fake, fake_likes, fake_source_id, ads_referral, ads_registration_started,
+	coalesce(profile_path,'')`
 
 const userSelectSQL = `SELECT ` + UserColumns + ` FROM users`
 
@@ -553,7 +555,8 @@ const userSelectDistanceSQL = `
 			cos(radians($1)) * cos(radians(latitude)) * cos(radians(longitude) - radians($2)) +
 			sin(radians($1)) * sin(radians(latitude))
 		)))) END AS distance,
-		coalesce(username,''), is_fake, fake_likes, fake_source_id, ads_referral, ads_registration_started
+		coalesce(username,''), is_fake, fake_likes, fake_source_id, ads_referral, ads_registration_started,
+		coalesce(profile_path,'')
 	FROM users`
 
 func parseStatesFromFile(path string) ([]State, error) {

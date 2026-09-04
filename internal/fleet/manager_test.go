@@ -53,10 +53,8 @@ func TestManagerModeTransitionsAndFallback(t *testing.T) {
 	if m.IsActive(cfg.MainBotID) != true {
 		t.Fatal("main bot must always be active")
 	}
-	// Helpers are always active (even in OFFPEAK); they show "return to main"
-	// instead of processing messages. Activity is determined by heartbeat, not mode.
-	if !m.IsActive("shard1") {
-		t.Fatal("helper must be active in off-peak mode (redirect-only)")
+	if m.IsActive("shard1") {
+		t.Fatal("helper must be inactive in off-peak mode")
 	}
 
 	m.mode.Store(ModePeak)

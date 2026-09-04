@@ -41,7 +41,7 @@ func (r *recordingThrottler) Penalize(d time.Duration) time.Duration {
 
 func TestClientUsesThrottlerInterface(t *testing.T) {
 	th := &recordingThrottler{}
-	client, err := NewClient("test-token", time.Second, "", "main", th, 1)
+	client, err := NewClient("test-token", time.Second, "", "main", th)
 	if err != nil {
 		t.Fatal(err)
 	}

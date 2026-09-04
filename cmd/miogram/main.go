@@ -62,7 +62,7 @@ func main() {
 		Max:       cfg.AIMDMax,
 		Cooldown:  cfg.FloodCooldown,
 	})
-	tg, err := telegram.NewClient(cfg.BotToken, cfg.HTTPTimeout, cfg.TelegramSOCKS5Proxy, cfg.BotID, limiter, cfg.OutboundShardCount)
+	tg, err := telegram.NewClient(cfg.BotToken, cfg.HTTPTimeout, cfg.TelegramSOCKS5Proxy, cfg.BotID, limiter)
 	if err != nil {
 		log.Fatalf("telegram client: %v", err)
 	}
@@ -122,10 +122,6 @@ func main() {
 	if err := botService.WarmHelpAssets(ctx); err != nil {
 		log.Printf("warm help assets: %v", err)
 	}
-	// One-time background migration of legacy users.image photos into the
-	// shared Profile Topic cache (telegram_assets). Idempotent, rate-limited,
-	// and self-skipping on helper bots (only main migrates).
-	go botService.MigrateOldProfilePhotos(ctx)
 	payService := payments.New(cfg, store, tg)
 	botService.SetPayments(payService)
 	scheduler := jobs.New(cfg, store, tg, q, botService)
