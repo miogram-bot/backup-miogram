@@ -152,6 +152,7 @@ func (s *Store) QueryUsers(ctx context.Context, query string, args ...any) ([]Us
 			&u.LastActivity, &u.LastCheckJoinAt, &u.IsCoinComplete, &u.IsLikes, &u.SameAge,
 			&u.Status, &u.Step, &u.PrevStep, &u.CreatedAt, &u.UniqID, &u.Distance, &u.Username,
 			&u.IsFake, &u.FakeLikes, &u.FakeSourceID, &u.ADSReferral, &u.ADSRegistrationStarted,
+			&u.ProfilePath,
 		); err != nil {
 			return nil, err
 		}

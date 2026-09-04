@@ -62,7 +62,7 @@ func main() {
 		Max:       cfg.AIMDMax,
 		Cooldown:  cfg.FloodCooldown,
 	})
-	tg, err := telegram.NewClient(cfg.BotToken, cfg.HTTPTimeout, cfg.TelegramSOCKS5Proxy, cfg.BotID, limiter)
+	tg, err := telegram.NewClient(cfg.BotToken, cfg.HTTPTimeout, cfg.TelegramSOCKS5Proxy, cfg.BotID, limiter, cfg.OutboundShardCount)
 	if err != nil {
 		log.Fatalf("telegram client: %v", err)
 	}

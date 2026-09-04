@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/url"
-	"path/filepath"
 	"strings"
 
 	"miogram/internal/storage"
@@ -141,7 +140,7 @@ func (s *Service) showUserProfile(ctx context.Context, c *UpdateContext, user st
 	if err != nil {
 		return err
 	}
-	if !resp.Ok && user.Image != "" {
+	if !resp.Ok && user.ProfilePath != "" {
 		params["photo"] = s.defaultProfilePhoto(user.Gender)
 		resp, err = s.send(ctx, "sendPhoto", params)
 	}
@@ -500,8 +499,9 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			_, err = s.checkProfileCoin(ctx, c)
 		}
 		return true, err
+
+
 	case "set_image":
-		completingProfile := c.User.PrevStep == "complete_profile"
 		fileID := photoID(c.Message)
 		if fileID == "" {
 			_, err := s.send(ctx, "sendMessage", map[string]any{
@@ -515,101 +515,62 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			return true, err
 		}
 
-		// Download photo to server as binary
-		profileDir := filepath.Join("bot", "profile-users")
-		profilePath := filepath.Join(profileDir, fmt.Sprintf("user_%s.jpg", c.UserID))
-		if err := s.tg.DownloadFile(ctx, fileID, profilePath); err != nil {
-			_, _ = s.send(ctx, "sendMessage", map[string]any{
+		// ۱. دانلود و ذخیره تصویر در فایل سیستم محلی
+		profilePath := s.downloadAndSaveProfilePhoto(ctx, fileID, c.UserID)
+		if profilePath == "" {
+			_, err := s.send(ctx, "sendMessage", map[string]any{
 				"chat_id":             c.UserID,
-				"text":                "⚠️ خطا: در دانلود عکس مشکلی پیش آمد. لطفاً دوباره تلاش کنید.",
+				"text":                "⚠️ خطا: در ذخیره تصویر مشکلی پیش آمد. لطفاً دوباره تلاش کنید.",
 				"reply_to_message_id": c.MessageID,
+				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+					{callbackButton("بیخیال ✏️ تغییر عکس", "start")},
+				})),
 			})
-			return true, fmt.Errorf("download profile photo: %w", err)
+			return true, err
 		}
 
-		_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='superseded' WHERE user_id=$1 AND status='pending'`, c.UserID)
-		var reviewID int64
-		err := s.store.DB().QueryRow(ctx, `INSERT INTO profile_reviews (user_id,file_id,status,created_at) VALUES ($1,$2,'pending',$3) RETURNING id`, c.UserID, fileID, c.Now).Scan(&reviewID)
+		// ۲. ذخیره file_id در دیتابیس (برای مرجع) و profile_path
+		_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2,profile_path=$3 WHERE user_id=$1`, c.UserID, fileID, profilePath)
 		if err != nil {
 			return true, err
 		}
 
-		// Send to admin group topic using LocalFile
+		// ۳. ارسال تصویر به گروه ادمین با دکمه بن (از فایل محلی)
 		adminGroupID := s.adminGroupID(ctx)
-		var resp telegram.APIResponse
-		var sendErr error
 		if adminGroupID != "" {
-			resp, sendErr = s.send(ctx, "sendPhoto", map[string]any{
+			_, sendErr := s.send(ctx, "sendPhoto", map[string]any{
 				"chat_id":           adminGroupID,
 				"message_thread_id": adminTopicProfile,
 				"photo":             telegram.LocalFile{Path: profilePath},
-				"caption":           fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", c.UserID, c.UserID, c.User.UniqID),
-				"parse_mode":        "HTML",
-				"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
-					callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
-					callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
-				}})),
-			})
-		}
-		if adminGroupID == "" || sendErr != nil || !resp.Ok {
-			// Fallback to support group or admin
-			fallbackChatID := c.Admin.Support
-			if fallbackChatID == "" {
-				fallbackChatID = s.cfg.AdminID
-			}
-			fallbackParams := map[string]any{
-				"chat_id":    fallbackChatID,
-				"photo":      telegram.LocalFile{Path: profilePath},
-				"caption":    fmt.Sprintf("🖼 درخواست تأیید عکس پروفایل\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s", c.UserID, c.UserID, c.User.UniqID),
+				"caption": fmt.Sprintf("🖼 تصویر پروفایل جدید\n\nکاربر: <a href='tg://user?id=%s'>%s</a>\nشناسه: /user_%s",
+					c.UserID, c.UserID, c.User.UniqID),
 				"parse_mode": "HTML",
-				"reply_markup": telegram.JSON(replyMarkupInline([][]button{{
-					callbackButton("❌ رد کردن", fmt.Sprintf("profile_review;reject;%d", reviewID)),
-					callbackButton("✅ تایید کردن", fmt.Sprintf("profile_review;approve;%d", reviewID)),
-				}})),
-			}
-			if fallbackChatID == c.Admin.AdminGroupID {
-				fallbackParams["message_thread_id"] = adminTopicProfile
-			}
-			resp, sendErr = s.send(ctx, "sendPhoto", fallbackParams)
-			if sendErr != nil || !resp.Ok {
-				_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET status='send_failed' WHERE id=$1`, reviewID)
-				if sendErr != nil {
-					return true, fmt.Errorf("send profile review: %w", sendErr)
-				}
-				return true, fmt.Errorf("send profile review failed")
-			}
-		}
-		if msg, ok := s.tg.SentMessage(resp); ok && len(msg.Photo) > 0 {
-			cachedID := msg.Photo[len(msg.Photo)-1].FileID
-			_, _ = s.store.DB().Exec(ctx, `UPDATE profile_reviews SET file_id=$2,message_id_admin=$3 WHERE id=$1`, reviewID, cachedID, msg.MessageID)
+				"reply_markup": telegram.JSON(replyMarkupInline([][]button{
+					{callbackButton("🚫 بن کاربر", fmt.Sprintf("profile_ban;%s", c.UserID))},
+				})),
+			})
+			_ = sendErr
 		}
 
-		// Store the image file_id and profile_path in users table
-		_, _ = s.store.DB().Exec(ctx, `UPDATE users SET image=$2,profile_path=$3 WHERE user_id=$1`, c.UserID, fileID, profilePath)
-
+		// ۴. به‌روزرسانی مرحله کاربر
 		_ = s.store.UpdateUserStepPrev(ctx, c.UserID, "start", "start")
 		c.User.Step = "start"
 		c.User.PrevStep = "start"
 		c.refreshStep()
-
-		// Reload user to update Image and ProfilePath fields
 		_ = s.reloadUser(ctx, c)
 
+		// ۵. پیام موفقیت به کاربر
 		_, err = s.send(ctx, "sendMessage", map[string]any{
 			"chat_id":      c.UserID,
-			"text":         "✅ عکس شما دریافت شد و پس از تأیید مدیریت در پروفایل نمایش داده می‌شود.\n\n💡 پروفایل شما تکمیل شد و ۵ سکه جایزه دریافت کردید!",
+			"text":         "✅ تصویر شما با موفقیت ثبت شد.",
 			"reply_markup": telegram.JSON(replyMarkupKeyboard(mainMenuKeyboard(s.isAdmin(c)))),
 		})
-
-		// Check and award profile completion coin
-		if err == nil {
-			_, err = s.checkProfileCoin(ctx, c)
+		if err != nil {
+			return true, err
 		}
 
-		// If profile was being completed and location is missing, ask for GPS
-		if err == nil && completingProfile && c.User.Latitude == 0 {
-			err = s.askProfileGPS(ctx, c)
-		}
+		// ۶. اهدای سکه در صورت تکمیل پروفایل
+		_, err = s.checkProfileCoin(ctx, c)
 		return true, err
 	}
 	return false, nil
@@ -756,7 +717,7 @@ func nextProfileCompletionField(user storage.User) string {
 	if user.City == "" {
 		return "city"
 	}
-	if user.Image == "" {
+	if user.ProfilePath == "" {
 		return "image"
 	}
 	if user.Latitude == 0 {

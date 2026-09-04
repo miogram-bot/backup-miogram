@@ -530,7 +530,7 @@ func (m *Manager) notifySender(ctx context.Context, job queue.PendingJob, reason
 		_ = telegram.EnqueueOutbound(ctx, m.q.Client(), targetBot, "sendMessage", map[string]any{
 			"chat_id": job.FromUserID,
 			"text":    text,
-		})
+		}, m.cfg.OutboundShardCount)
 	}
 }
 
@@ -553,28 +553,22 @@ func (m *Manager) enterMode(ctx context.Context, mode string) {
 		// Users migrate lazily via consistent-hash suggestions on interaction;
 		// nothing to do eagerly here.
 	case ModeOffPeak:
-		// Run off-peak migration off the leader duty loop so a large fleet
-		// can't stall lease renewal.
-		go func() {
-			bgCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			m.migrateHelpersToMain(bgCtx)
-		}()
+		// No automatic migration on transition. Users who are on helpers
+		// remain there until they initiate action by messaging the helper,
+		// which shows the "return to main" link.
 	}
 }
 
 // IsActive reports whether deliveries may flow through botID right now.
 // The main bot is always considered active (it is the fallback target).
+// Helpers are always active — in OFFPEAK they show the "return to main"
+// message instead of processing messages, but they never shut down.
 func (m *Manager) IsActive(botID string) bool {
 	if botID == "" {
 		return false
 	}
 	if botID == m.cfg.MainBotID {
 		return true
-	}
-	_, knownHelper := m.cfg.Helpers[botID]
-	if knownHelper && m.Mode() == ModeOffPeak {
-		return false
 	}
 	if m.q == nil {
 		// No shared state available; stay optimistic, send failures are
@@ -626,9 +620,9 @@ var legacyBotUsernames = map[string]string{
 }
 
 // SuggestMigration sends the peak-hour handoff message with a deep-link button
-// to the helper chosen by consistent hashing. The link carries the original
-// user ID (?start=migrate_<id>) so the helper can correlate onboarding and
-// flush pending deliveries. Caller enforces cooldowns.
+// to the helper chosen by consistent hashing. The link carries the user ID
+// (?start=classroom_<id>) so the helper registers the user and flushes pending
+// deliveries. Caller enforces cooldowns.
 func (m *Manager) SuggestMigration(ctx context.Context, send func(method string, params map[string]any) error, userID string) (string, error) {
 	helper := m.AssignHelper(userID)
 	username := m.HelperUsername(helper)
@@ -764,7 +758,7 @@ func (m *Manager) notifyReturnToMain(ctx context.Context, userID, helper string)
 		"chat_id":                  userID,
 		"text":                     text,
 		"disable_web_page_preview": true,
-	}); err != nil {
+	}, m.cfg.OutboundShardCount); err != nil {
 		log.Printf("fleet: notify return-to-main %s: %v", userID, err)
 	}
 }

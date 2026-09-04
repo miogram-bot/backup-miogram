@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"miogram/internal/fleet"
 	"miogram/internal/telegram"
 )
 
@@ -159,7 +160,7 @@ func (s *Service) handleAuth(ctx context.Context, c *UpdateContext) (handled boo
 	}
 
 	if c.UserID != s.cfg.AdminID && c.User.Status == "block" && c.Text != SupportButton && c.Text != "/support" && part(c.ExStep, 0) != "support" {
-		_, _ = s.send(ctx, "sendMessage", map[string]any{"chat_id": c.UserID, "text": "⛔️ حساب شما مسدود است. برای پیگیری از گزینه «📨 پشتیبانی» استفاده کنید.", "reply_markup": telegram.JSON(replyMarkupKeyboard([][]button{{textButton(SupportButton)}}))})
+		_, _ = s.send(ctx, "sendMessage", map[string]any{"chat_id": c.UserID, "text": "⛔️ حساب شما مسدود است. برای پیگیری از گزینه «📨 ارسال پیام به پشتیبانی» استفاده کنید.", "reply_markup": telegram.JSON(replyMarkupKeyboard([][]button{{textButton(SupportButton)}}))})
 		return true, true, nil
 	}
 
@@ -290,6 +291,16 @@ func (s *Service) handleOnboarding(ctx context.Context, c *UpdateContext) (bool,
 				return false, true, err
 			}
 			_ = s.reloadUser(ctx, c)
+
+			// PEAK mode: registration is complete. Send ONLY the migration
+			// message. The original message that triggered registration is
+			// IGNORED (not processed, not stored, no response).
+			if s.fleet != nil && s.fleet.Mode() == fleet.ModePeak && s.cfg.BotID == s.cfg.MainBotID {
+				if err := s.sendMigrationToHelper(ctx, c); err != nil {
+					return false, true, err
+				}
+				return true, true, nil
+			}
 
 			_, _ = s.send(ctx, "sendMessage", map[string]any{
 				"chat_id":             c.UserID,
