@@ -134,7 +134,6 @@ func TestProfileCompletionAdvancesInOrder(t *testing.T) {
 		t.Fatalf("third field = %q, want image", got)
 	}
 	user.Image = "file-id"
-	user.ProfilePath = "/path/to/photo.jpg"
 	if got := nextProfileCompletionField(user); got != "gps" {
 		t.Fatalf("fourth field = %q, want gps", got)
 	}

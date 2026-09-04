@@ -975,11 +975,9 @@ func (s *Service) downloadAndSaveProfilePhoto(ctx context.Context, fileID, userI
 }
 
 func (s *Service) userProfilePhoto(ctx context.Context, user storage.User) any {
-	// Check local file from profile_path stored in DB
-	if user.ProfilePath != "" {
-		if _, err := os.Stat(user.ProfilePath); err == nil {
-			return telegram.LocalFile{Path: user.ProfilePath}
-		}
+	path := s.profilePhotoPath(user.UserID)
+	if _, err := os.Stat(path); err == nil {
+		return telegram.LocalFile{Path: path}
 	}
 	return s.defaultProfilePhoto(user.Gender)
 }

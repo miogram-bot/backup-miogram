@@ -51,7 +51,6 @@ type User struct {
 	FakeSourceID           int64
 	ADSReferral            bool
 	ADSRegistrationStarted bool
-	ProfilePath            string
 }
 
 type Amount struct {

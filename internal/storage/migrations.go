@@ -64,7 +64,6 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS fake_source_id BIGINT NOT NULL DEFAUL
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ads_referral BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS ads_registration_started BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS assigned_bot TEXT;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS profile_path TEXT;
 CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_users_gender_age_activity ON users(gender, age, last_activity DESC);
 CREATE INDEX IF NOT EXISTS idx_users_gender_activity ON users(gender, last_activity DESC);

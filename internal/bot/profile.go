@@ -140,7 +140,7 @@ func (s *Service) showUserProfile(ctx context.Context, c *UpdateContext, user st
 	if err != nil {
 		return err
 	}
-	if !resp.Ok && user.ProfilePath != "" {
+	if !resp.Ok && user.Image != "" {
 		params["photo"] = s.defaultProfilePhoto(user.Gender)
 		resp, err = s.send(ctx, "sendPhoto", params)
 	}
@@ -529,8 +529,8 @@ func (s *Service) handleProfileEditInput(ctx context.Context, c *UpdateContext) 
 			return true, err
 		}
 
-		// ۲. ذخیره file_id در دیتابیس (برای مرجع) و profile_path
-		_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2,profile_path=$3 WHERE user_id=$1`, c.UserID, fileID, profilePath)
+		// ۲. ذخیره file_id در دیتابیس (برای مرجع)
+		_, err := s.store.DB().Exec(ctx, `UPDATE users SET image=$2 WHERE user_id=$1`, c.UserID, fileID)
 		if err != nil {
 			return true, err
 		}
@@ -717,7 +717,7 @@ func nextProfileCompletionField(user storage.User) string {
 	if user.City == "" {
 		return "city"
 	}
-	if user.ProfilePath == "" {
+	if user.Image == "" {
 		return "image"
 	}
 	if user.Latitude == 0 {
