@@ -417,20 +417,20 @@ func (s *Service) resolveDelivery(ctx context.Context, userID string) (string, e
 		if botID, err := s.redis.GetUserBot(ctx, userID); err != nil {
 			log.Printf("resolver redis read %s: %v", userID, err)
 		} else if botID != "" {
-			// Guard: if the mapped helper is inactive (off-peak or dead
-			// heartbeat), atomically reroute the user back to the main bot
-			// so the response is not queued into a dead outbound lane.
-			if botID != s.cfg.MainBotID && s.fleet != nil && !s.fleet.IsActive(botID) {
-				log.Printf("resolver offpeak fallback %s: helper %s inactive, rerouting to main", userID, botID)
-				if _, err := s.redis.MoveUserBot(ctx, userID, s.cfg.MainBotID); err != nil {
-					log.Printf("resolver offpeak fallback redis %s: %v", userID, err)
-				}
-				if s.routing != nil {
-					if err := s.routing.UpdateAssignedBot(ctx, userID, s.cfg.MainBotID); err != nil {
-						log.Printf("resolver offpeak fallback durable %s: %v", userID, err)
+			if botID != s.cfg.MainBotID && s.fleet != nil {
+				if s.fleet.Mode() == fleet.ModeOffPeak && !s.fleet.IsActive(botID) {
+					log.Printf("resolver offpeak fallback %s: helper %s inactive, moving to main", userID, botID)
+					if _, err := s.redis.MoveUserBot(ctx, userID, s.cfg.MainBotID); err != nil {
+						log.Printf("resolver offpeak fallback redis %s: %v", userID, err)
 					}
+					if s.routing != nil {
+						if err := s.routing.UpdateAssignedBot(ctx, userID, s.cfg.MainBotID); err != nil {
+							log.Printf("resolver offpeak fallback durable %s: %v", userID, err)
+						}
+					}
+					return s.cfg.MainBotID, nil
 				}
-				return s.cfg.MainBotID, nil
+				return s.deliverVia(ctx, userID, botID)
 			}
 			return s.deliverVia(ctx, userID, botID)
 		}
